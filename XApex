@@ -1,0 +1,2199 @@
+// ==UserScript==
+// @name         XApex
+// @namespace    XA
+// @version      1.0
+// @description  Pekora Trading extension
+// @author       fluouliss
+// @match        https://pekora.pro/*
+// @match        https://www.pekora.pro/*
+// @grant        GM_xmlhttpRequest
+// @connect      raw.githubusercontent.com
+// @connect      www.pekoramons.lol
+// @connect      pekora.pro
+// @connect      www.pekora.pro
+// @connect      www.pekoramons.lol
+// @connect      pekoramons.lol
+// @run-at       document-idle
+// @icon         https://pekora.pro/favicon.ico
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  const VALUES_JSON_URL = "https://www.pekoramons.lol/items.json";
+  const FALLBACK_VALUES_JSON_URL = "https://raw.githubusercontent.com/unitedbygrief/koronevalues/main/valu.json";
+  let ITEMS = [];
+  let NAME_VALUE_MAP = new Map();
+  let NAME_ID_MAP = new Map();
+  let NAME_ACRONYM_MAP = new Map();
+  let FETCHED = false;
+
+  function fetchValuesJson(url) {
+    return new Promise((resolve, reject) => {
+      try {
+        GM_xmlhttpRequest({
+          method: "GET",
+          url,
+          headers: { Accept: "application/json" },
+          onload(res) {
+            try {
+              const parsed = JSON.parse(res.responseText);
+              if (!Array.isArray(parsed) || parsed.length === 0) {
+                reject(new Error(`Empty or invalid values JSON from ${url}`));
+                return;
+              }
+              resolve(parsed);
+            } catch (e) {
+              reject(e);
+            }
+          },
+          onerror(err) {
+            reject(err);
+          }
+        });
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
+
+  let _loadKoromonsPromise = null;
+
+  async function loadKoromons() {
+    // FETCHED flips true synchronously below, before the fetch itself
+    // resolves — without caching the in-flight promise, any caller that
+    // invokes loadKoromons() while the first fetch is still pending would
+    // hit this early return with ITEMS still empty, instead of actually
+    // waiting for real data (each page's setInterval loop would eventually
+    // pick up the real values on a later tick regardless, but anything
+    // gated behind a "run once" flag — e.g. per-section total lines — would
+    // permanently see empty data and never retry).
+    if (FETCHED) return _loadKoromonsPromise;
+    FETCHED = true;
+    _loadKoromonsPromise = (async () => {
+      try {
+        ITEMS = await fetchValuesJson(VALUES_JSON_URL);
+      } catch (e) {
+        console.error("pekoramons fetch error, falling back to GitHub values", e);
+        try {
+          ITEMS = await fetchValuesJson(FALLBACK_VALUES_JSON_URL);
+        } catch (e2) {
+          console.error("pekoramons fallback fetch error", e2);
+          ITEMS = [];
+        }
+      }
+      buildNameValueMap();
+      return { ITEMS, NAME_VALUE_MAP };
+    })();
+    return _loadKoromonsPromise;
+  }
+
+  function cleanNameForLookup(name) {
+    if (!name || typeof name !== "string") return "";
+    return name.replace(/[\u200B-\u200F\uFEFF]/g, "")
+      .replace(/[^a-zA-Z0-9 ]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+  }
+
+  function buildNameValueMap() {
+    NAME_VALUE_MAP = new Map();
+    NAME_ID_MAP = new Map();
+    NAME_ACRONYM_MAP = new Map();
+    if (!Array.isArray(ITEMS)) return;
+    for (const it of ITEMS) {
+      const n = (it.Name || it.name || it.title || "").toString();
+      if (!n) continue;
+      const v = (typeof it.Value !== "undefined" ? Number(it.Value) : (typeof it.value !== "undefined" ? Number(it.value) : 0));
+      const key = cleanNameForLookup(n);
+      NAME_VALUE_MAP.set(key, isFinite(v) ? v : 0);
+      if (it.itemId) NAME_ID_MAP.set(key, it.itemId);
+      const acr = (it.Acronym || it.acronym || "").toString().trim().toLowerCase();
+      if (acr && acr !== "n/a" && acr !== "") NAME_ACRONYM_MAP.set(acr, key);
+    }
+  }
+
+  function lookupIdForName(rawName) {
+    if (!rawName) return null;
+    const cleaned = cleanNameForLookup(rawName.trim());
+    if (NAME_ID_MAP.has(cleaned)) return NAME_ID_MAP.get(cleaned);
+    const stripped = rawName.trim().replace(/\(.*?\)|\[.*?\]|\{.*?\}/g, "").trim();
+    const cleanedStripped = cleanNameForLookup(stripped);
+    return NAME_ID_MAP.get(cleanedStripped) || null;
+  }
+
+  function lookupValueForNameModal(rawName) {
+    if (!rawName) return undefined;
+    const name = String(rawName).trim();
+    const cleaned = cleanNameForLookup(name);
+    if (NAME_VALUE_MAP.has(cleaned)) return NAME_VALUE_MAP.get(cleaned);
+    const stripped = name.replace(/\(.*?\)|\[.*?\]|\{.*?\}/g, "").trim();
+    const cleanedStripped = cleanNameForLookup(stripped);
+    if (cleanedStripped && NAME_VALUE_MAP.has(cleanedStripped)) return NAME_VALUE_MAP.get(cleanedStripped);
+
+    for (const [k, v] of NAME_VALUE_MAP.entries()) {
+      if (!k) continue;
+      if (k === cleaned) return v;
+      if (k.length > 3 && cleaned.includes(k)) return v;
+      if (cleaned.length > 3 && k.includes(cleaned)) return v;
+      const kWords = k.split(" ").slice(0, 2).join(" ");
+      if (kWords && cleaned.includes(kWords)) return v;
+    }
+    return undefined;
+  }
+
+  function formatNumber(n) {
+    if (n === null || n === undefined || !isFinite(Number(n))) return "N/A";
+    return Number(n).toLocaleString();
+  }
+
+  const PEKORA_FILLER_WORDS = new Set(["of", "the", "a", "an", "and"]);
+
+  function pekoraItemMatches(rawName, query) {
+    const q = (query || "").trim().toLowerCase();
+    if (!q) return true;
+    if (!rawName) return false;
+    const nameLower = String(rawName).toLowerCase();
+    if (nameLower.includes(q)) return true;
+    const cleaned = cleanNameForLookup(rawName);
+    if (cleaned.includes(q)) return true;
+    if (NAME_ACRONYM_MAP.has(q) && NAME_ACRONYM_MAP.get(q) === cleaned) return true;
+    for (const [acr, nameKey] of NAME_ACRONYM_MAP.entries()) {
+      if (acr.startsWith(q) && nameKey === cleaned) return true;
+    }
+    const words = cleaned.split(" ").filter(Boolean);
+    if (words.length > 1) {
+      const initials = words.map(w => w[0]).join("");
+      if (initials === q || initials.startsWith(q)) return true;
+      const sigInitials = words.filter(w => !PEKORA_FILLER_WORDS.has(w)).map(w => w[0]).join("");
+      if (sigInitials.length > 1 && (sigInitials === q || sigInitials.startsWith(q))) return true;
+    }
+    return false;
+  }
+    const INLINE_ROBUX_SVG = `<svg xmlns="http://www.w3.org/2000/svg" version="1.1" id="branded" x="0px" y="0px" width="24" height="24" viewBox="0 0 24 24" xml:space="preserve">
+  <style>.st0{fill:#02B757;}.st3{fill:#02B757;}</style>
+  <g transform="translate(-2,-114)"><g>
+    <path class="st3" d="m 14,138 c -6.6,0 -12,-5.4 -12,-12 0,-6.6 5.4,-12 12,-12 6.6,0 12,5.4 12,12 0,6.6 -5.4,12 -12,12 z m 0,-22 c -5.5,0 -10,4.5 -10,10 0,5.5 4.5,10 10,10 5.5,0 10,-4.5 10,-10 0,-5.5 -4.5,-10 -10,-10 z"/>
+    <path class="st3" d="m 19,131 h -5 c -0.2,0 -0.4,-0.1 -0.6,-0.2 L 9,127.3 v 2.7 c 0,0.6 -0.4,1 -1,1 -0.6,0 -1,-0.4 -1,-1 v -8 c 0,-0.6 0.4,-1 1,-1 h 4 c 1.1,0 1.7,1.1 1.7,3 0,0.6 -0.1,1.2 -0.2,1.7 -0.4,1.2 -1.2,1.3 -1.5,1.3 h -0.1 l 2.5,2 H 19 c 0.3,0 0.5,-0.5 0.5,-1 0,-0.4 -0.1,-1 -0.5,-1 h -2 c -1.4,0 -2.5,-1.3 -2.5,-3 0,-0.7 0.2,-1.4 0.5,-1.9 0.5,-0.7 1.2,-1.1 2,-1.1 h 3 c 0.6,0 1,0.4 1,1 0,0.6 -0.4,1 -1,1 h -3 c -0.1,0 -0.2,0 -0.3,0.2 -0.1,0.2 -0.2,0.5 -0.2,0.8 0,0.4 0.2,1 0.5,1 h 2 c 1.4,0 2.5,1.3 2.5,3 0,1.7 -1.1,3 -2.5,3 z M 9,125 h 2.6 c 0.1,-0.5 0.1,-1.5 0,-2 H 9 Z"/>
+  </g></g></svg>`;
+    /* ---------------------------
+       Add a searched item straight to the trade offer by calling the
+       site's own React state directly, instead of clicking a native
+       DOM button. The inventory panel component exposes a stable
+       `onToggleItem(item)` prop (found by walking the fiber tree up
+       from the grid) that isn't baked to any specific rendered
+       button — calling it works for any item in the inventory,
+       regardless of which page the native grid currently has loaded.
+    --------------------------- */
+    function pekoraFindInventoryController(node) {
+      const fiberKey = Object.keys(node).find((k) => k.startsWith("__reactFiber$"));
+      if (!fiberKey) return null;
+      let fiber = node[fiberKey];
+      while (fiber) {
+        const props = fiber.memoizedProps;
+        if (props && typeof props.onToggleItem === "function" && Array.isArray(props.items)) {
+          return props;
+        }
+        fiber = fiber.return;
+      }
+      return null;
+    }
+
+    function pekoraAddItemDirect(grid, item) {
+      if (!grid || !grid.isConnected) {
+        console.warn("[pekora] pekoraAddItemDirect: grid is missing/detached", grid);
+        return false;
+      }
+      const controllerProps = pekoraFindInventoryController(grid);
+      if (!controllerProps) {
+        console.warn("[pekora] pekoraAddItemDirect: couldn't find onToggleItem on the fiber tree above", grid);
+        return false;
+      }
+      try {
+        controllerProps.onToggleItem(item);
+        return true;
+      } catch (e) {
+        console.error("[pekora] pekoraAddItemDirect: onToggleItem threw", e);
+        return false;
+      }
+    }
+
+    // Finds the site's own (hashed) CSS class for a given prefix by scanning
+    // stylesheets at runtime, instead of hardcoding it — the exact suffix
+    // (e.g. "itemThumbSelected-0-2-17") can change across builds/sessions.
+    const _pekoraClassCache = {};
+    function pekoraFindClassByPrefix(prefix) {
+      if (_pekoraClassCache[prefix]) return _pekoraClassCache[prefix];
+      const re = new RegExp(`\\.(${prefix}[\\w-]*)`);
+      for (const sheet of document.styleSheets) {
+        let rules;
+        try { rules = sheet.cssRules; } catch (e) { continue; }
+        if (!rules) continue;
+        for (const rule of rules) {
+          if (!rule.selectorText) continue;
+          const m = rule.selectorText.match(re);
+          if (m) {
+            _pekoraClassCache[prefix] = m[1];
+            return m[1];
+          }
+        }
+      }
+      return null;
+    }
+
+    // Mirrors the real "selected" look (itemThumbSelected class + checkmark
+    // badge) onto an injected search-result card, toggling on/off exactly
+    // like the native onToggleItem-driven UI does.
+    function pekoraToggleSelectedLook(btn, isSelected) {
+      const thumb = btn.querySelector('[class*="itemThumb"]');
+      if (!thumb) return;
+      const selClass = pekoraFindClassByPrefix("itemThumbSelected");
+      const checkClass = pekoraFindClassByPrefix("selectedCheck");
+      if (selClass) thumb.classList.toggle(selClass, isSelected);
+      if (checkClass) {
+        let check = thumb.querySelector(`.${CSS.escape(checkClass)}`);
+        if (isSelected) {
+          if (!check) {
+            check = document.createElement("span");
+            check.className = checkClass;
+            check.textContent = "✓";
+            thumb.appendChild(check);
+          }
+        } else if (check) {
+          check.remove();
+        }
+      }
+    }
+
+  loadKoromons();
+
+  (function () {
+    "use strict";
+
+    (function injectTradeCSS() {
+      // Plain text inside these containers gets forced white on OBC (see
+      // pekoraGetThemeColors). Buttons/selects/inputs/links/icons are excluded
+      // (and their descendants, via the "X *" forms) so we don't clobber
+      // controls that already carry their own readable color pairing —
+      // e.g. Accept/Decline buttons, and the win/lose arrow icon color.
+      const obcContainers = [
+        'tradeList-0-2-', 'tradeRow-0-2-', 'itemCard', 'itemButton',
+        'itemGrid', 'itemThumb', 'details-0-2-', 'section-0-2-',
+        'offerPanel', 'builderColumn', 'inventorySection'
+      ];
+      const notControls = ':not(button):not(button *):not(select):not(select *):not(input):not(input *):not(a):not(a *):not(svg):not(svg *):not(path)';
+      const obcTextRule = obcContainers
+        .map(c => `html.pekora-obc-active [class*="${c}"] *${notControls}`)
+        .join(',\n') + ' { color: #ffffff !important; }';
+
+      const css = `
+[class*="valueCurrencyLabel"],[class*="priceLabel"],[class*="totalCurrencyLabel"]{color:rgb(150,150,150) !important;}
+[class*="itemName-0-2-184"]{display:-webkit-box !important;-webkit-line-clamp:2 !important;-webkit-box-orient:vertical !important;overflow:hidden !important;text-overflow:ellipsis !important;}
+[class*="itemButton"]{display:flex !important;flex-direction:column !important;justify-content:flex-start !important;}
+[class*="itemButton"].pekora-search-hidden{display:none !important;}
+[class*="itemValue-0-2-185"]{margin-top:2px !important;}
+[class*="rowDate"]{position:absolute !important;top:4px !important;right:4px !important;font-size:10px !important;}
+html.pekora-obc-active [class*="title-0-2-"] { color: #ffffff !important; }
+${obcTextRule}
+      `;
+      const st = document.createElement("style");
+      st.textContent = css;
+      document.head.appendChild(st);
+    })();
+
+    // Reads the site's own adaptive surface color (--white-color, which flips
+    // between a light and a dark value depending on the player's chosen theme)
+    // to decide whether our injected text/icons need light-mode or dark-mode ink.
+    //
+    // Theme "packs" like OBC lay a dark background-image over the page without
+    // touching --white-color/--text-color-primary at all (they stay pinned to
+    // the light-theme defaults), so trusting those variables alone renders our
+    // elements as light-theme white-on-dark. Detect that case via the body's
+    // background-image first and force dark-style colors when it's present.
+    function pekoraGetThemeColors() {
+      let isDarkPack = false;
+      try {
+        isDarkPack = /obc/i.test(getComputedStyle(document.body).backgroundImage || "");
+      } catch (e) {}
+      try {
+        // Marks <html> so the OBC-scoped CSS rules in injectTradeCSS can target
+        // trade list rows / item cards without us having to inline-style every
+        // one of them individually.
+        document.documentElement.classList.toggle("pekora-obc-active", isDarkPack);
+      } catch (e) {}
+
+      let isLight = null;
+      if (!isDarkPack) {
+        try {
+          // --white-color may be authored as hex, rgb(), hsl(), or a named color —
+          // applying it to a real element and reading it back via getComputedStyle
+          // normalizes it to "rgb(r, g, b)" regardless of source format, unlike
+          // reading the raw custom property text directly.
+          const probe = document.createElement("div");
+          probe.style.cssText = "position:absolute;width:0;height:0;overflow:hidden;pointer-events:none;";
+          probe.style.color = "var(--white-color)";
+          document.body.appendChild(probe);
+          const resolved = getComputedStyle(probe).color;
+          probe.remove();
+          const m = resolved.match(/(\d+)\D+(\d+)\D+(\d+)/);
+          if (m) {
+            const [r, g, b] = [Number(m[1]), Number(m[2]), Number(m[3])];
+            isLight = (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.6;
+          }
+        } catch (e) {}
+        if (isLight === null) {
+          isLight = !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches);
+        }
+      } else {
+        isLight = false;
+      }
+
+      if (isDarkPack) {
+        return {
+          isLight: false, ink: "#ffffff", inkFaint: "rgba(255,255,255,0.3)",
+          pillBg: "rgb(45,47,48)", surfaceBg: "rgb(57,57,57)", surfaceBorder: "rgba(255,255,255,0.15)",
+        };
+      }
+      return isLight
+        ? {
+            isLight: true, ink: "#1a1a1a", inkFaint: "rgba(0,0,0,0.3)",
+            pillBg: "rgb(105,108,113)", surfaceBg: "var(--white-color)", surfaceBorder: "var(--text-color-secondary)",
+          }
+        : {
+            isLight: false, ink: "#ffffff", inkFaint: "rgba(255,255,255,0.3)",
+            pillBg: "rgb(45,47,48)", surfaceBg: "var(--white-color)", surfaceBorder: "var(--text-color-secondary)",
+          };
+    }
+
+    // Intercept trade API responses to capture partner user IDs and compute diffs
+    let tradePartnerMap = {};
+    const activeSearchBoxes = [];
+    let tradeListIds = [];
+    let tradeDiffCache = {};
+    let loggedInUserId = null;
+    let _pekoraSearchActive = false; // flag to prevent 200ms interval from corrupting search grid
+    // Persists query/sort/open-state/fetched-items across re-injections, keyed by
+    // section index. The site's own React tree can wipe our injected search UI
+    // (e.g. right after adding an item to the offer), and the 200ms watcher below
+    // rebuilds it from scratch — this lets that rebuild restore exactly where the
+    // user left off instead of resetting to a blank, closed search box.
+    let _pekoraSearchState = {};
+
+    fetch("/apisite/users/v1/users/authenticated", { credentials: "include" })
+      .then(r => r.json()).then(d => { if (d && d.id) loggedInUserId = d.id; })
+      .catch(() => {});
+
+    fetch("/api/auth/me", { credentials: "include" })
+      .then(r => r.json()).then(d => { if (d && d.id && !loggedInUserId) loggedInUserId = d.id; })
+      .catch(() => {});
+
+    function computeTradeOffers(data) {
+      if (!data || !data.offers || data.offers.length < 2) return null;
+      // Identify my offer: if we know logged-in user ID, use it directly
+      // Otherwise fall back to assuming data.user is the partner
+      let myOffer, partnerOffer;
+      if (loggedInUserId) {
+        myOffer = data.offers.find(o => o.user && o.user.id === loggedInUserId);
+        partnerOffer = data.offers.find(o => o.user && o.user.id !== loggedInUserId);
+      } else {
+        const partnerId = data.user && data.user.id;
+        partnerOffer = data.offers.find(o => o.user && o.user.id === partnerId);
+        myOffer = data.offers.find(o => o.user && o.user.id !== partnerId);
+        if (myOffer && myOffer.user) loggedInUserId = myOffer.user.id;
+      }
+      if (!partnerOffer || !myOffer) return null;
+
+      const sumOffer = (offer) => {
+        let val = 0;
+        for (const a of (offer.userAssets || [])) {
+          const r = a.recentAveragePrice || 0;
+          const v = lookupValueForNameModal(a.name);
+          val += (typeof v === "number" && v > 0) ? v : r;
+        }
+        return val;
+      };
+      const giveVal = sumOffer(myOffer);
+      const recvVal = sumOffer(partnerOffer);
+      return { giveVal, recvVal };
+    }
+
+    async function fetchTradeDiff(tradeId) {
+      if (tradeDiffCache[tradeId] && tradeDiffCache[tradeId].fetched) return;
+      tradeDiffCache[tradeId] = { fetched: true };
+      try {
+        const resp = await fetch(`/apisite/trades/v1/trades/${tradeId}`, { credentials: "include" });
+        const data = await resp.json();
+        if (data.offers) {
+          for (const o of data.offers) if (o.user) tradePartnerMap[o.user.name.toLowerCase()] = o.user.id;
+        }
+        const diff = computeTradeOffers(data);
+        if (diff) tradeDiffCache[tradeId] = { ...diff, fetched: true };
+      } catch(e) {}
+    }
+
+    async function loadTradeList() {
+      if (!/^\/trades/i.test(location.pathname)) return;
+      try {
+        const resp = await fetch("/apisite/trades/v1/trades/inbound?cursor=", { credentials: "include" });
+        const data = await resp.json();
+        if (data && data.data) {
+          tradeListIds = data.data.map(t => t.id);
+          tradeDiffCache = {};
+          for (const t of data.data) fetchTradeDiff(t.id);
+        }
+      } catch(e) {}
+    }
+    (function waitForValues() {
+      if (NAME_VALUE_MAP.size > 0) { loadTradeList(); }
+      else { setTimeout(waitForValues, 300); }
+    })();
+
+    (function interceptTradeXHR() {
+      const OrigXHR = unsafeWindow.XMLHttpRequest;
+      function PatchedXHR() {
+        const xhr = new OrigXHR();
+        const origOpen = xhr.open.bind(xhr);
+        let _url = "";
+        xhr.open = function(method, url, ...rest) {
+          _url = url;
+          return origOpen(method, url, ...rest);
+        };
+        xhr.addEventListener("load", function() {
+          try {
+            // List API — capture ordered trade IDs, batch-fetch details, track type+cursor
+            if (/\/apisite\/trades\/v1\/trades\/(inbound|outbound|completed|inactive)/.test(_url)) {
+              const data = JSON.parse(xhr.responseText);
+              if (data && data.data) {
+                tradeListIds = data.data.map(t => t.id);
+                for (const t of data.data) fetchTradeDiff(t.id);
+                const typeMatch = _url.match(/\/trades\/(inbound|outbound|completed|inactive)/);
+                const type = typeMatch && typeMatch[1];
+                if (type && type !== "inbound") {
+                  if (pekoraLoadMore.type !== type) pekoraLoadMoreReset(); // tab switched — clear old rows
+                  pekoraLoadMore.type = type;
+                  pekoraLoadMore.cursor = data.nextPageCursor || null;
+                }
+              }
+              return;
+            }
+            // Detail API — compute diff from XHR too (e.g. when user clicks a trade)
+            if (/\/apisite\/trades\/v1\/trades\/\d+/.test(_url)) {
+              const data = JSON.parse(xhr.responseText);
+              if (data.offers) {
+                for (const o of data.offers) if (o.user) tradePartnerMap[o.user.name.toLowerCase()] = o.user.id;
+                const diff = computeTradeOffers(data);
+                if (diff) tradeDiffCache[data.id] = { ...diff, fetched: true };
+              }
+            }
+          } catch(e) {}
+        });
+        return xhr;
+      }
+      PatchedXHR.prototype = OrigXHR.prototype;
+      unsafeWindow.XMLHttpRequest = PatchedXHR;
+    })();
+
+    // ── Load-more state for outbound / completed / inactive trade history ──
+    const pekoraLoadMore = { type: null, cursor: null, loading: false, initialised: false };
+
+    let pekoraCurrentDetail = null;
+    let pekoraCurrentListItem = null;
+
+    function pekoraLoadMoreReset() {
+      pekoraLoadMore.type = null;
+      pekoraLoadMore.cursor = null;
+      pekoraLoadMore.loading = false;
+      pekoraLoadMore.initialised = false;
+      document.getElementById("pekora-lm-wrap")?.remove();
+      document.querySelectorAll("[data-pekora-lm-row]").forEach(el => el.remove());
+    }
+
+    function pekoraGetRowCls() {
+      const row = document.querySelector('[class*="tradeRow-0-2-"]');
+      if (!row) return null;
+      const pick = (prefix) => {
+        const el = row.querySelector(`[class*="${prefix}"]`);
+        return el ? (el.className.split(" ").find(c => c.includes(prefix)) || "") : "";
+      };
+      return {
+        row: row.className.split(" ").find(c => c.includes("tradeRow-0-2-") && !c.includes("Selected")) || "",
+        avatarFrame: pick("avatarFrame"),
+        rowName: pick("rowName"),
+        rowStatus: pick("rowStatus"),
+        rowDate: pick("rowDate"),
+      };
+    }
+
+    function pekoraRenderNativeRow(listItem, detail, cls, avatarUrl) {
+      const partner = listItem.user || {};
+      const date = listItem.created
+        ? new Date(listItem.created).toLocaleDateString("en-US", { month: "numeric", day: "numeric", year: "2-digit" })
+        : "";
+
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = cls.row;
+      btn.style.cssText = "position:relative;width:100%;overflow:hidden;";
+
+      // Avatar
+      const avatarSpan = document.createElement("span");
+      avatarSpan.className = cls.avatarFrame;
+      const img = document.createElement("img");
+      img.alt = partner.name || "";
+      img.style.cssText = "width:100%;height:100%;object-fit:cover;";
+      img.onerror = () => { img.style.display = "none"; };
+      if (avatarUrl) img.src = avatarUrl;
+      avatarSpan.appendChild(img);
+      btn.appendChild(avatarSpan);
+
+      const infoSpan = document.createElement("span");
+      infoSpan.innerHTML =
+        `<span class="${cls.rowName}">${partner.name || "Unknown"}</span>` +
+        `<span class="${cls.rowStatus}">${listItem.status || ""}</span>`;
+      btn.appendChild(infoSpan);
+
+      const dateSpan = document.createElement("span");
+      dateSpan.className = cls.rowDate;
+      dateSpan.textContent = date;
+      btn.appendChild(dateSpan);
+
+      if (detail && detail.offers && detail.offers.length >= 2) {
+        let myOffer = detail.offers.find(o => o.user && o.user.id === loggedInUserId);
+        let theirOffer = detail.offers.find(o => o.user && o.user.id !== loggedInUserId);
+        if (!myOffer || !theirOffer) [myOffer, theirOffer] = detail.offers;
+        const sum = (assets) => (assets || []).reduce((s, a) => {
+          const v = lookupValueForNameModal(a.name);
+          return s + ((typeof v === "number" && v > 0) ? v : (a.recentAveragePrice || 0));
+        }, 0);
+        const giveVal = sum(myOffer.userAssets) + (myOffer.robux || 0);
+        const recvVal = sum(theirOffer.userAssets) + (theirOffer.robux || 0);
+        const barColor = recvVal >= giveVal ? "#2bbf5a" : "#d72020";
+        const fmt = n => Math.round(n).toLocaleString();
+        const theme = pekoraGetThemeColors();
+        const pill = document.createElement("div");
+        pill.className = "pekora-row-pill";
+        pill.style.cssText = "position:absolute;right:0;bottom:4px;width:78px;height:50px;overflow:hidden;pointer-events:none;";
+        pill.innerHTML =
+          `<div style="margin-top:2%;height:90%;width:15px;float:left;background-color:${barColor};border-top-left-radius:7px;border-bottom-left-radius:7px;"></div>` +
+          `<div style="float:left;padding-left:4px;font-size:11px;font-weight:700;color:${theme.ink};line-height:1.3;">` +
+            `<span>${fmt(giveVal)}</span><br><hr style="margin:2px 0;border-color:${theme.inkFaint};"><span>${fmt(recvVal)}</span>` +
+          `</div>`;
+        btn.appendChild(pill);
+
+        btn.onclick = (e) => { e.stopPropagation(); pekoraLoadDetailIntoPanel(detail, listItem); };
+      }
+
+      return btn;
+    }
+
+    function pekoraGetDetailCls() {
+      const get = (prefix) => {
+        const el = document.querySelector(`[class*="${prefix}-0-2-"]`);
+        return el ? el.className.split(" ").find(c => c.includes(`${prefix}-0-2-`)) || "" : `${prefix}-0-2-0`;
+      };
+      return {
+        section:      get("section"),
+        sectionTitle: get("sectionTitle"),
+        itemGrid:     get("itemGrid"),
+        itemCard:     get("itemCard"),
+        thumbWrap:    get("thumbWrap"),
+        itemThumb:    get("itemThumb"),
+        limitedBadge: get("limitedBadge"),
+        itemName:     get("itemName"),
+        itemValue:    get("itemValue"),
+        valueCurrency:      get("valueCurrency"),
+        valueCurrencyLabel: get("valueCurrencyLabel"),
+        totalCurrencyLabel: get("totalCurrencyLabel"),
+        totalRow:           get("totalRow"),
+        totalValue:         get("totalValue"),
+      };
+    }
+
+    async function pekoraLoadDetailIntoPanel(detail, listItem) {
+      const panel = document.querySelector('[class*="details-0-2-"]');
+      if (!panel) return;
+
+      const c = pekoraGetDetailCls();
+      // listItem.user is always the partner in the list API
+      const partnerId = listItem.user && listItem.user.id;
+      let theirOffer = detail.offers.find(o => o.user && o.user.id === partnerId);
+      let myOffer = detail.offers.find(o => o.user && o.user.id !== partnerId);
+      if (!myOffer || !theirOffer) [myOffer, theirOffer] = detail.offers;
+      const partnerName = (theirOffer.user && theirOffer.user.name) || "Unknown";
+
+      // Fetch item thumbnails in one batch
+      const allAssets = [...(myOffer.userAssets || []), ...(theirOffer.userAssets || [])];
+      const assetIds = allAssets.map(a => a.assetId).filter(Boolean);
+      const thumbMap = {};
+      if (assetIds.length) {
+        try {
+          const td = await fetch(
+            `/apisite/thumbnails/v1/assets?assetIds=${assetIds.join(",")}&size=150x150&format=Png`,
+            { credentials: "include" }
+          ).then(r => r.json());
+          (td.data || []).forEach(t => { thumbMap[t.targetId] = t.imageUrl; });
+        } catch(e) {}
+      }
+
+      const renderItems = (assets) => (assets || []).map(a => {
+        const thumb = thumbMap[a.assetId] || "";
+        const badge = a.serialNumber ? `<span class="${c.limitedBadge}">#${a.serialNumber}</span>` : "";
+        const rap = a.recentAveragePrice || 0;
+        return `<div class="${c.itemCard}">
+          <div class="${c.thumbWrap}">
+            <div class="${c.itemThumb}"><img src="${thumb}" alt="${a.name}" onerror="this.style.visibility='hidden'"></div>
+            ${badge}
+          </div>
+          <div class="${c.itemName}">${a.name}</div>
+          <div class="${c.itemValue}">
+            <div class="${c.valueCurrency}">
+              <span class="pekora-robux-icon" style="display:inline-flex;align-items:center;width:16px;height:16px;margin-right:3px;">${INLINE_ROBUX_SVG.replace('width="24" height="24"', 'width="16" height="16"')}</span>
+              <span class="${c.valueCurrencyLabel || "valueCurrencyLabel-0-2-0"}">${rap.toLocaleString()}</span>
+            </div>
+          </div>
+        </div>`;
+      }).join("");
+
+      const renderSection = (title, offer) => {
+        const rapTotal = (offer.userAssets || []).reduce((s, a) => s + (a.recentAveragePrice || 0), 0);
+        const lblCls = c.totalCurrencyLabel || c.valueCurrencyLabel || "valueCurrencyLabel-0-2-0";
+        return `
+        <section class="${c.section}">
+          <h2 class="${c.sectionTitle}">${title}</h2>
+          <div class="${c.itemGrid}">${renderItems(offer.userAssets)}</div>
+          <div class="${c.totalRow}">
+            <span>Total Value:</span>
+            <span class="${c.totalValue}">
+              <div class="${c.valueCurrency}">
+                <span class="pekora-robux-icon" style="display:inline-flex;align-items:center;width:21px;height:21px;margin-right:4px;">${INLINE_ROBUX_SVG.replace('width="24" height="24"', 'width="21" height="21"')}</span>
+                <span class="${lblCls}">${rapTotal.toLocaleString()}</span>
+              </div>
+            </span>
+          </div>
+        </section>`;
+      };
+
+      // Hide React's existing children (keeps fiber tree intact, no reconciliation issues)
+      // then show our content in an overlay with no background so it looks native.
+      Array.from(panel.children)
+        .filter(c => c.id !== "pekora-detail-overlay")
+        .forEach(c => { c.dataset.pekoraHidden = "1"; c.style.visibility = "hidden"; });
+
+      let overlay = document.getElementById("pekora-detail-overlay");
+      if (!overlay) {
+        overlay = document.createElement("div");
+        overlay.id = "pekora-detail-overlay";
+        if (window.getComputedStyle(panel).position === "static") panel.style.position = "relative";
+        overlay.style.cssText = "position:absolute;inset:0;z-index:10;overflow-y:auto;";
+        panel.appendChild(overlay);
+      }
+      overlay.innerHTML =
+        `<h1 class="detailTitle-0-2-17">Trade with ${partnerName}</h1>` +
+        renderSection("Items you will give", myOffer) +
+        renderSection("Items you will receive", theirOffer);
+
+      pekoraCurrentDetail = detail;
+      pekoraCurrentListItem = listItem;
+    }
+
+    async function pekoraDoLoadMore() {
+      if (pekoraLoadMore.loading || !pekoraLoadMore.type) return;
+      pekoraLoadMore.loading = true;
+
+      const btn = document.getElementById("pekora-lm-btn");
+      if (btn) { btn.textContent = "Loading..."; btn.disabled = true; }
+
+      try {
+        const url = `/apisite/trades/v1/trades/${pekoraLoadMore.type}?limit=25&cursor=${encodeURIComponent(pekoraLoadMore.cursor || "")}`;
+        const data = await fetch(url, { credentials: "include" }).then(r => r.json());
+        if (!data || !data.data) return;
+
+        pekoraLoadMore.cursor = data.nextPageCursor || null;
+
+        const cls = pekoraGetRowCls();
+        const tradeList = document.querySelector('[class*="tradeList-0-2-"]');
+        if (cls && tradeList) {
+          const details = await Promise.all(
+            data.data.map(t => fetch(`/apisite/trades/v1/trades/${t.id}`, { credentials: "include" }).then(r => r.json()).catch(() => null))
+          );
+          // Batch-fetch partner headshots using list API partner IDs directly
+          const partnerIds = data.data.map(t => t.user && t.user.id).filter(Boolean);
+          const avatarMap = {};
+          if (partnerIds.length) {
+            try {
+              const thumbData = await fetch(
+                `/apisite/thumbnails/v1/users/avatar-headshot?userIds=${partnerIds.join(",")}&size=150x150&format=Png&isCircular=false`,
+                { credentials: "include" }
+              ).then(r => r.json());
+              (thumbData.data || []).forEach(entry => { avatarMap[entry.targetId] = entry.imageUrl; });
+            } catch(e) {}
+          }
+
+          data.data.forEach((t, i) => {
+            const avatarUrl = t.user ? (avatarMap[t.user.id] || "") : "";
+            const row = pekoraRenderNativeRow(t, details[i], cls, avatarUrl);
+            row.dataset.pekoraLmRow = "1";
+            tradeList.appendChild(row);
+          });
+        }
+
+        if (btn) {
+          if (pekoraLoadMore.cursor) { btn.textContent = "Load More"; btn.disabled = false; }
+          else { btn.parentElement.remove(); }
+        }
+      } catch(e) {
+        if (btn) { btn.textContent = "Load More"; btn.disabled = false; }
+      } finally {
+        pekoraLoadMore.loading = false;
+      }
+    }
+
+    async function pekoraEnsureLoadMoreSection() {
+      if (!/^\/trades/i.test(location.pathname)) return;
+      const sel = document.querySelector('[class*="select-0-2-"]');
+      if (!sel) return;
+      const type = sel.value;
+      if (!type || type === "inbound") { pekoraLoadMoreReset(); return; }
+
+      // Reset if user switched trade type
+      if (pekoraLoadMore.type && pekoraLoadMore.type !== type) pekoraLoadMoreReset();
+
+      const tradeList = document.querySelector('[class*="tradeList-0-2-"]');
+      if (!tradeList) return;
+
+      // First time on this type: fetch page 1 to get the nextPageCursor
+      if (!pekoraLoadMore.initialised) {
+        pekoraLoadMore.initialised = true;
+        pekoraLoadMore.type = type;
+        try {
+          const data = await fetch(`/apisite/trades/v1/trades/${type}?limit=25&cursor=`, { credentials: "include" }).then(r => r.json());
+          pekoraLoadMore.cursor = (data && data.nextPageCursor) || null;
+        } catch(e) { pekoraLoadMore.cursor = null; }
+      }
+
+      // Inject the wrap+list+button into the tradeList if not already there
+      if (!document.getElementById("pekora-lm-btn")) {
+        if (!pekoraLoadMore.cursor) return;
+        const cls = pekoraGetRowCls();
+        if (!cls) return;
+
+        // Button sits directly inside tradeList as the last child — rows get inserted before it
+        const btnWrap = document.createElement("div");
+        btnWrap.id = "pekora-lm-wrap";
+        btnWrap.style.cssText = "display:flex;justify-content:center;padding:8px 0;";
+        const selectEl = document.querySelector('[class*="select-0-2-"]');
+        const btn = document.createElement("button");
+        btn.id = "pekora-lm-btn";
+        btn.type = "button";
+        btn.textContent = "Load More";
+        if (selectEl) {
+          const s = window.getComputedStyle(selectEl);
+          btn.style.cssText = `height:${s.height};padding:${s.padding};font-size:${s.fontSize};font-family:${s.fontFamily};font-weight:${s.fontWeight};background:${s.background};border:${s.border};border-radius:${s.borderRadius};cursor:pointer;min-width:120px;`;
+          // Inherit text color from parent instead of copying the select's green accent color
+          btn.style.color = "inherit";
+        } else {
+          btn.style.cssText = "height:32px;padding:0 12px;font-size:14px;border-radius:4px;cursor:pointer;min-width:120px;";
+        }
+        btn.onclick = pekoraDoLoadMore;
+        btnWrap.appendChild(btn);
+        tradeList.insertAdjacentElement("afterend", btnWrap);
+      }
+    }
+
+    const makePill = (label, diff, pct) => {
+      const isGain = diff >= 0;
+      const arrowColor = isGain ? "rgb(43, 191, 90)" : "rgb(215, 32, 32)";
+      const sign = diff >= 0 ? "+" : "-";
+      const verb = isGain ? "winning" : "losing";
+      const arrowPath = isGain
+        ? `<path fill="currentColor" d="M9 4h6v8h4.84L12 19.84L4.16 12H9V4Z"></path>`
+        : `<path fill="currentColor" d="M15 20H9v-8H4.16L12 4.16L19.84 12H15v8Z"></path>`;
+      const tooltip = `You are ${verb} ${Math.abs(diff).toLocaleString()} ${label.toLowerCase()} on this trade.`;
+      const pillBg = pekoraGetThemeColors().pillBg;
+      return `<div data-toggle="tooltip" title="" style="height:30px;background-color:${pillBg} !important;color:#ffffff !important;align-items:center;padding:5px 12px;cursor:default;flex-grow:0;flex-shrink:0;width:fit-content;display:flex;justify-content:center;font-size:20px;white-space:nowrap;" data-original-title="${tooltip}"><span style="display:flex;align-items:center;color:#ffffff !important;"><svg xmlns="http://www.w3.org/2000/svg" style="transform:scale(1.3);margin-right:3px;color:${arrowColor} !important;" width="24" height="24" viewBox="0 0 24 24"><g transform="translate(0 24) scale(1 -1)">${arrowPath}</g></svg><span style="color:#ffffff !important;">${sign}${Math.abs(diff).toLocaleString()} ${label} (${sign}${Math.abs(pct).toFixed(0)}%)</span></span></div>`;
+    };
+
+    function runTradesPageInjector() {
+      if (!/^\/trades/i.test(location.pathname) && !/^\/users\/\d+\/trade/i.test(location.pathname)) return;
+
+      // Load-more section for outbound / completed / inactive
+      pekoraEnsureLoadMoreSection().catch(() => {});
+
+      // If React re-rendered the panel and wiped our overlay, re-apply it
+      if (pekoraCurrentDetail && pekoraCurrentListItem && !document.getElementById("pekora-detail-overlay")) {
+        pekoraLoadDetailIntoPanel(pekoraCurrentDetail, pekoraCurrentListItem).catch(() => {});
+      }
+
+      // Reload list if trade rows count doesn't match what we have
+      const tradeRows = Array.from(document.querySelectorAll('[class*="tradeRow-0-2-"]:not([data-pekora-lm-row])'));
+      if (tradeRows.length > 0 && tradeRows.length !== tradeListIds.length) loadTradeList();
+      tradeRows.forEach((row, i) => {
+        if (!row._pekoraNativeClickBound) {
+          row._pekoraNativeClickBound = true;
+          row.addEventListener("click", () => {
+            pekoraCurrentDetail = null;
+            pekoraCurrentListItem = null;
+            const p = document.querySelector('[class*="details-0-2-"]');
+            if (p) {
+              document.getElementById("pekora-detail-overlay")?.remove();
+              p.querySelectorAll("[data-pekora-hidden]").forEach(c => {
+                c.style.visibility = "";
+                delete c.dataset.pekoraHidden;
+              });
+            }
+          });
+        }
+        const tradeId = tradeListIds[i];
+        if (!tradeId) return;
+        const diff = tradeDiffCache[tradeId];
+        if (!diff || diff.giveVal === undefined) return;
+
+        const overallColor = diff.recvVal >= diff.giveVal ? "#2bbf5a" : "#d72020";
+
+        let box = row.querySelector(".pekora-row-pill");
+        if (!box) {
+          row.style.position = "relative";
+          box = document.createElement("div");
+          box.className = "pekora-row-pill";
+          box.style.cssText = "position:absolute;right:0;bottom:4px;width:78px;height:50px;overflow:hidden;pointer-events:none;";
+          row.appendChild(box);
+        }
+
+        const fmt = (n) => Math.round(n).toLocaleString();
+        const theme = pekoraGetThemeColors();
+        box.innerHTML =
+          `<div style="margin-top:2%;margin-left:0;height:90%;width:15px;float:left;background-color:${overallColor};border-top-left-radius:7px;border-bottom-left-radius:7px;"></div>` +
+          `<div style="float:left;padding-left:4px;font-size:11px;font-weight:700;color:${theme.ink};line-height:1.3;">` +
+            `<span>${fmt(diff.giveVal)}</span><br>` +
+            `<hr style="margin:2px 0;border-color:${theme.inkFaint};">` +
+            `<span>${fmt(diff.recvVal)}</span>` +
+          `</div>`;
+      });
+
+      // Inject link icon next to trade title
+      const titleEl = document.querySelector('[class*="detailTitle"]');
+      if (titleEl) {
+        const rawText = Array.from(titleEl.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent).join("").trim();
+        const match = rawText.match(/Trade with (.+)/i);
+        if (match) {
+          const partnerName = match[1].trim();
+          const partnerId = tradePartnerMap[partnerName.toLowerCase()];
+          if (partnerId) {
+            const expectedHref = `https://www.koromons.net/player?id=${partnerId}`;
+            let linkEl = titleEl.querySelector(".pekora-title-link");
+            if (!linkEl) {
+              linkEl = document.createElement("a");
+              linkEl.className = "pekora-title-link";
+              linkEl.target = "_blank";
+              linkEl.rel = "noopener noreferrer";
+              linkEl.style.cssText = "display:inline-flex;align-items:center;margin-left:8px;opacity:0.8;vertical-align:middle;";
+              linkEl.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" height="21px" viewBox="0 -960 960 960" width="21px" fill="${pekoraGetThemeColors().ink}"><path d="M200-120q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h280v80H200v560h560v-280h80v280q0 33-23.5 56.5T760-120H200Zm188-212-56-56 372-372H560v-80h280v280h-80v-144L388-332Z"/></svg>`;
+              titleEl.appendChild(linkEl);
+            }
+            if (linkEl.href !== expectedHref) linkEl.href = expectedHref;
+          }
+        }
+      }
+
+      // Counter / send trade UI injection (builderColumn layout: itemButton grid,
+      // offerPanel slots, totalRow/totalValue) — used by both /trades counter view
+      // and /users/X/trade send-trade view, since they share the same DOM.
+      // ── Trade page search bar injection ──────────────────────────────
+      const searchBarTheme = pekoraGetThemeColors();
+      document.querySelectorAll('[class*="inventorySection"]').forEach((section, sIdx) => {
+        if (section.querySelector('.pekora-trade-search')) return;
+        const header = section.querySelector('[class*="inventoryHeader"]');
+        if (!header) return;
+        const grid = section.querySelector('[class*="itemGrid"]');
+        if (!grid) return;
+        if (sIdx === 0 && !loggedInUserId) return;
+        const pagination = section.querySelector('[class*="pagination"]');
+        const savedState = _pekoraSearchState[sIdx] || {};
+
+        const wrap = document.createElement("div");
+        wrap.style.cssText = "display:flex;gap:8px;align-items:center;margin-bottom:12px;";
+        const input = document.createElement("input");
+        input.className = "pekora-trade-search";
+        input.type = "text";
+        input.placeholder = "Loading items...";
+        input.autocomplete = "off";
+        input.style.cssText = `color:${searchBarTheme.ink};width:180px;border:1px solid ${searchBarTheme.surfaceBorder};height:34px;outline:0;padding:0 12px;font-size:15px;background:${searchBarTheme.surfaceBg};font-weight:500;border-radius:0;`;
+        const sortSelect = document.createElement("select");
+        sortSelect.className = "pekora-trade-sort";
+        sortSelect.style.cssText = `color:${searchBarTheme.ink};border:1px solid ${searchBarTheme.surfaceBorder};height:34px;outline:0;padding:0 8px;font-size:15px;background:${searchBarTheme.surfaceBg};font-weight:500;border-radius:0;cursor:pointer;`;
+        sortSelect.innerHTML = '<option value="default">Sort: Default</option><option value="value-desc">Value ↓</option><option value="value-asc">Value ↑</option><option value="name-asc">A → Z</option><option value="name-desc">Z → A</option>';
+        input.value = savedState.query || "";
+        sortSelect.value = savedState.sort || "default";
+        wrap.appendChild(input);
+        wrap.appendChild(sortSelect);
+        header.insertAdjacentElement("afterend", wrap);
+
+        // Search results grid (separate from React's grid)
+        const searchGrid = document.createElement("div");
+        searchGrid.className = grid.className;
+        searchGrid.style.display = "none";
+        grid.insertAdjacentElement("afterend", searchGrid);
+
+        // Search pagination
+        const searchPag = document.createElement("div");
+        searchPag.className = pagination ? pagination.className : "";
+        searchPag.style.cssText = "gap:8px;display:none;font-size:18px;margin-top:16px;align-items:center;font-weight:400;justify-content:center;";
+        const spPrev = document.createElement("button");
+        spPrev.type = "button"; spPrev.textContent = "\u2039";
+        spPrev.className = pagination ? (pagination.querySelector("button") || {}).className || "" : "";
+        spPrev.style.cssText = `color:${searchBarTheme.ink};width:34px;border:1px solid ${searchBarTheme.surfaceBorder};height:34px;padding:0;font-size:26px;background:color-mix(in srgb, ${searchBarTheme.ink} 10%, ${searchBarTheme.surfaceBg});line-height:28px;border-radius:6px;cursor:pointer;`;
+        const spLabel = document.createElement("span");
+        const spNext = document.createElement("button");
+        spNext.type = "button"; spNext.textContent = "\u203A";
+        spNext.style.cssText = spPrev.style.cssText;
+        searchPag.appendChild(spPrev); searchPag.appendChild(spLabel); searchPag.appendChild(spNext);
+        searchGrid.insertAdjacentElement("afterend", searchPag);
+
+        let allItems = savedState.allItems || null;
+        let searchPage = 0;
+        let currentMatches = [];
+        const PAGE_SIZE = 10;
+
+        function getSectionUserId() {
+          if (sIdx === 0) return loggedInUserId;
+          const m = location.pathname.match(/\/users\/(\d+)\/trade/);
+          return m ? Number(m[1]) : null;
+        }
+
+        // Load all items silently — skip if we already have a cached copy from
+        // before the last time our injected UI got wiped and rebuilt.
+        if (allItems) {
+          input.placeholder = `Search ${allItems.length} items...`;
+          if (savedState.wasOpen) showSearch(input.value.trim());
+        } else {
+          (async function() {
+            const userId = getSectionUserId();
+            if (!userId) { input.placeholder = "Search items..."; return; }
+            const items = [];
+            let cursor = "";
+            while (true) {
+              const url = `/apisite/inventory/v1/users/${userId}/assets/collectibles?limit=100${cursor ? "&cursor=" + encodeURIComponent(cursor) : ""}`;
+              try {
+                const res = await fetch(url, { credentials: "include" });
+                if (!res.ok) break;
+                const data = await res.json();
+                if (data.data) items.push(...data.data);
+                if (data.nextPageCursor) cursor = data.nextPageCursor;
+                else break;
+              } catch(e) { break; }
+            }
+            allItems = items;
+            _pekoraSearchState[sIdx] = Object.assign(_pekoraSearchState[sIdx] || {}, { allItems: items });
+            input.placeholder = `Search ${items.length} items...`;
+            if (savedState.wasOpen) showSearch(input.value.trim());
+          })();
+        }
+
+        function renderPage() {
+          searchGrid.innerHTML = "";
+          const start = searchPage * PAGE_SIZE;
+          const page = currentMatches.slice(start, start + PAGE_SIZE);
+          const nativeThumb = grid.querySelector('[class*="itemThumb"]');
+          // First class token only — a sampled native thumb might itself
+          // currently be selected and carry the extra itemThumbSelected class.
+          const thumbClass = nativeThumb ? nativeThumb.className.split(" ")[0] : "";
+          for (const item of page) {
+            const id = item.assetId || item.userAssetId || "";
+            const name = item.name || "";
+            const rap = item.recentAveragePrice || 0;
+            const serial = item.serialNumber;
+            const val = lookupValueForNameModal(name);
+            const displayVal = (typeof val === "number" && val > 0) ? val : rap;
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = grid.querySelector('[class*="itemButton"]') ? grid.querySelector('[class*="itemButton"]').className : "itemButton-0-2-15";
+            btn.style.cssText = `color:${searchBarTheme.ink};width:100%;border:0;cursor:pointer;display:block;padding:0;background:transparent;text-align:left;`;
+            btn.innerHTML = `
+              <div class="${thumbClass}" style="width:100%;border:1px solid transparent;overflow:hidden;position:relative;background:color-mix(in srgb, ${searchBarTheme.ink} 8%, ${searchBarTheme.surfaceBg});aspect-ratio:1/1;">
+                <img style="width:100%;height:100%;object-fit:contain;" src="/thumbs/asset.ashx?assetId=${id}&width=150&height=150" alt="${name}" />
+                ${serial ? `<span style="left:7px;color:${searchBarTheme.isLight ? "#ffffff" : "#1a1a1a"};bottom:6px;height:23px;display:inline-flex;padding:0 7px;position:absolute;font-size:13px;min-width:24px;background:color-mix(in srgb, ${searchBarTheme.ink} 52%, transparent);align-items:center;font-weight:500;border-radius:12px;justify-content:center;">#${serial}</span>` : ""}
+              </div>
+              <div style="color:${searchBarTheme.ink};margin:7px 0 1px;font-size:17px;min-height:42px;font-weight:400;line-height:1.18;overflow-wrap:break-word;">${name}</div>
+              <div style="gap:4px;color:var(--robux-color);display:flex;font-size:17px;align-items:center;font-weight:400;line-height:1.15;">
+                <span class="icon-robux-16x16"></span><span>${rap.toLocaleString()}</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:4px;margin-top:2px;">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1094 1466.2" style="width:18px;height:18px;flex-shrink:0"><path fill="#0084dd" d="M1094 521.6 0 0v469.5l141-67.4 250 119.2L0 707.8v369.7l815.6 388.7L315 893l779-371.4z"></path></svg>
+                <span>${displayVal.toLocaleString()}</span>
+              </div>
+            `;
+            let isSelected = false;
+            btn.addEventListener("click", () => {
+              const added = pekoraAddItemDirect(grid, item);
+              // Keep the search open either way (don't reveal the native grid,
+              // which the site resets to page 1 once an item leaves the
+              // offerable pool) so you can keep adding more matches without
+              // any visual jump.
+              if (added) {
+                isSelected = !isSelected; // onToggleItem toggles both ways
+                pekoraToggleSelectedLook(btn, isSelected);
+              } else {
+                console.warn(`[pekora] couldn't add "${name}" — see warning above for details`);
+              }
+            });
+            searchGrid.appendChild(btn);
+          }
+          const totalPages = Math.ceil(currentMatches.length / PAGE_SIZE);
+          spLabel.textContent = `Page ${searchPage + 1} of ${totalPages}`;
+          spPrev.disabled = searchPage === 0;
+          spNext.disabled = searchPage + 1 >= totalPages;
+        }
+
+        spPrev.onclick = () => { if (searchPage > 0) { searchPage--; renderPage(); } };
+        spNext.onclick = () => { if ((searchPage + 1) * PAGE_SIZE < currentMatches.length) { searchPage++; renderPage(); } };
+
+        function showSearch(query) {
+          if (!allItems) return;
+          _pekoraSearchActive = true;
+          _pekoraSearchState[sIdx] = Object.assign(_pekoraSearchState[sIdx] || {}, {
+            wasOpen: true, query, sort: sortSelect.value, allItems,
+          });
+          // Respect the accessory type dropdown (the native one, not our sort)
+          const nativeSelects = section.querySelectorAll('select:not(.pekora-trade-sort)');
+          const typeSelect = nativeSelects.length ? nativeSelects[0] : null;
+          const selectedType = typeSelect ? typeSelect.value : "null";
+          let pool = [...allItems];
+          if (selectedType && selectedType !== "null") {
+            // The collectibles API doesn't return assetType, so match via items.json TypeId
+            pool = pool.filter(item => {
+              const id = item.assetId || item.userAssetId || "";
+              const entry = ITEMS.find(it => String(it.itemId || it.ItemId) === String(id));
+              if (entry && entry.TypeId) return String(entry.TypeId) === selectedType;
+              // Fallback: check if API returned type info
+              const t = String(item.assetType || item.assetTypeId || item.type || "");
+              return t === selectedType;
+            });
+          }
+          let filtered = query ? pool.filter(item => pekoraItemMatches(item.name || "", query)) : pool;
+          const sort = sortSelect.value;
+          if (sort !== "default") {
+            filtered.sort((a, b) => {
+              const nameA = a.name || ""; const nameB = b.name || "";
+              if (sort === "name-asc") return nameA.localeCompare(nameB);
+              if (sort === "name-desc") return nameB.localeCompare(nameA);
+              const valA = lookupValueForNameModal(nameA) || a.recentAveragePrice || 0;
+              const valB = lookupValueForNameModal(nameB) || b.recentAveragePrice || 0;
+              if (sort === "value-desc") return valB - valA;
+              if (sort === "value-asc") return valA - valB;
+              return 0;
+            });
+          }
+          currentMatches = filtered;
+          searchPage = 0;
+          grid.style.display = "none";
+          if (pagination) pagination.style.display = "none";
+          searchGrid.style.display = "";
+          searchPag.style.display = "flex";
+          renderPage();
+        }
+
+        function hideSearch() {
+          _pekoraSearchActive = false;
+          if (_pekoraSearchState[sIdx]) _pekoraSearchState[sIdx].wasOpen = false;
+          searchGrid.style.display = "none";
+          searchPag.style.display = "none";
+          grid.style.display = "";
+          if (pagination) pagination.style.display = "";
+        }
+
+        input.addEventListener("input", () => {
+          const q = input.value.trim();
+          if (!q && sortSelect.value === "default") hideSearch(); else showSearch(q);
+        });
+        sortSelect.addEventListener("change", () => {
+          const q = input.value.trim();
+          if (!q && sortSelect.value === "default") hideSearch();
+          else if (allItems) showSearch(q);
+        });
+        // Re-filter when accessory type dropdown changes
+        const nativeTypeSelect = section.querySelector('select:not(.pekora-trade-sort)');
+        if (nativeTypeSelect && !nativeTypeSelect._pekoraListenerAdded) {
+          nativeTypeSelect._pekoraListenerAdded = true;
+          nativeTypeSelect.addEventListener("change", () => {
+            const q = input.value.trim();
+            if (q || sortSelect.value !== "default") showSearch(q);
+            else hideSearch();
+          });
+        }
+      });
+
+      const builderCol = document.querySelector('[class*="builderColumn"]');
+      if (builderCol) {
+        if (!_pekoraSearchActive) {
+          // Inventory items (left panel) — re-run every tick so values update once
+          // NAME_VALUE_MAP loads (don't gate on _pekoraCounterDone or values stay 0).
+          // Skipped while search is active since it touches every
+          // [class*="itemButton"], including our own search-result buttons.
+          document.querySelectorAll('[class*="itemButton"]').forEach(btn => {
+            const nameEl = btn.querySelector('[class*="itemName"]');
+            const valEl = btn.querySelector('[class*="itemValue"]');
+            if (!nameEl || !valEl) return;
+            const name = (nameEl.textContent || "").trim();
+            const val = lookupValueForNameModal(name);
+            const rap = parseInt((valEl.children[1]?.textContent || "").replace(/[^0-9]/g, "")) || 0;
+            const displayVal = (typeof val === "number" && val > 0) ? val : rap;
+            let span = valEl.querySelector(".pekora-counter-val");
+            if (!span) {
+              // Wrap existing icon+number in a row so column-flex doesn't split them
+              const rapRow = document.createElement("div");
+              rapRow.style.cssText = "display:flex;align-items:center;gap:2px;";
+              while (valEl.firstChild) rapRow.appendChild(valEl.firstChild);
+              valEl.appendChild(rapRow);
+              valEl.style.cssText = "display:flex;flex-direction:column;align-items:flex-start;";
+              span = document.createElement("div");
+              span.className = "pekora-counter-val";
+              span.style.cssText = "display:flex;align-items:center;gap:4px;";
+              span.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1094 1466.2" style="width:18px;height:18px;flex-shrink:0"><path fill="#0084dd" d="M1094 521.6 0 0v469.5l141-67.4 250 119.2L0 707.8v369.7l815.6 388.7L315 893l779-371.4z"></path></svg><span></span>`;
+              valEl.appendChild(span);
+            }
+            const numEl = span.querySelector("span");
+            if (numEl) numEl.textContent = displayVal.toLocaleString();
+          });
+        }
+
+        // Filled offer slots and totals — always runs, even while search is
+        // active, so the offer total updates immediately after adding an
+        // item via search instead of waiting until the dropdown is closed.
+        // Scope to first offerPanel only (Your Offer)
+        const offerPanels = builderCol.querySelectorAll('[class*="offerPanel"]');
+        let offerTotal = 0, offerRap = 0;
+        (offerPanels[0] || builderCol).querySelectorAll('[class*="slotFilled"]').forEach(slot => {
+          const nameEl = slot.querySelector('[class*="slotName"]');
+          const valEl = slot.querySelector('[class*="slotValue"]');
+          if (!nameEl || !valEl) return;
+          const name = (nameEl.textContent || "").trim();
+          const val = lookupValueForNameModal(name);
+
+          // RAP is in the second child span (icon is first, number is second)
+          const rap = parseInt((valEl.children[1]?.textContent || "").replace(/[^0-9]/g, "")) || 0;
+
+          const displayVal = (typeof val === "number" && val > 0) ? val : rap;
+          offerTotal += displayVal;
+          offerRap += rap;
+
+          let korEl = valEl.querySelector(".pekora-slot-val");
+          if (!korEl) {
+            valEl.style.cssText = "display:inline-flex;align-items:center;gap:6px;";
+            korEl = document.createElement("span");
+            korEl.className = "pekora-slot-val";
+            korEl.style.cssText = "display:inline-flex;align-items:center;gap:4px;";
+            korEl.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1094 1466.2" style="width:18px;height:18px;flex-shrink:0"><path fill="#0084dd" d="M1094 521.6 0 0v469.5l141-67.4 250 119.2L0 707.8v369.7l815.6 388.7L315 893l779-371.4z"></path></svg><span></span>`;
+            valEl.appendChild(korEl);
+          }
+          const sp = korEl.querySelector("span");
+          if (sp) sp.textContent = displayVal.toLocaleString();
+        });
+
+        // Total rows — handle all (Your Offer + Your Request)
+        const injectTotalVal = (totalValEl, value) => {
+          if (!totalValEl) return;
+          totalValEl.closest('[class*="totalRow"]')?.style.setProperty("align-items", "flex-start");
+          let totalClone = totalValEl._pekoraCounterTotal;
+          if (!totalClone || !totalClone.isConnected) {
+            const rapRow = document.createElement("div");
+            rapRow.style.cssText = "display:flex;align-items:center;gap:4px;";
+            while (totalValEl.firstChild) rapRow.appendChild(totalValEl.firstChild);
+            const fontIcon = rapRow.querySelector('[class*="valueCurrencyIcon"], [class*="icon-robux"]');
+            if (fontIcon && !fontIcon.dataset.pekoraSvg) {
+              fontIcon.dataset.pekoraSvg = "1";
+              fontIcon.className = "pekora-robux-icon";
+              fontIcon.style.cssText = "display:inline-flex;align-items:center;width:21px;height:21px;";
+              fontIcon.innerHTML = INLINE_ROBUX_SVG.replace('width="24" height="24"', 'width="21" height="21"');
+            }
+            totalValEl.appendChild(rapRow);
+            totalValEl.style.cssText = "display:flex;flex-direction:column;align-items:flex-end;";
+            totalClone = document.createElement("div");
+            totalClone.style.cssText = "display:flex;align-items:center;gap:4px;";
+            totalClone.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1094 1466.2" style="width:18px;height:18px;flex-shrink:0"><path fill="#0084dd" d="M1094 521.6 0 0v469.5l141-67.4 250 119.2L0 707.8v369.7l815.6 388.7L315 893l779-371.4z"></path></svg><span></span>`;
+            totalValEl.appendChild(totalClone);
+            totalValEl._pekoraCounterTotal = totalClone;
+          }
+          const sp = totalClone.querySelector("span");
+          if (sp) sp.textContent = value.toLocaleString();
+        };
+
+        const totalValEls = builderCol.querySelectorAll('[class*="totalValue"]');
+        // First = Your Offer, Second = Your Request
+        injectTotalVal(totalValEls[0], offerTotal);
+
+        // Your Request total — sum slots in request panel
+        let requestTotal = 0, requestRap = 0;
+        [(offerPanels[1] || null)].filter(Boolean).forEach((panel) => {
+          panel.querySelectorAll('[class*="slotFilled"]').forEach(slot => {
+            const nameEl = slot.querySelector('[class*="slotName"]');
+            if (!nameEl) return;
+            const name = (nameEl.textContent || "").trim();
+            const val = lookupValueForNameModal(name);
+            const rap = parseInt((slot.querySelector('[class*="slotValue"]')?.children[1]?.textContent || "").replace(/[^0-9]/g, "")) || 0;
+            requestRap += rap;
+            requestTotal += (typeof val === "number" && val > 0) ? val : rap;
+          });
+        });
+        injectTotalVal(totalValEls[1], requestTotal);
+
+        // Diff bars between pagination and partner inventory
+        const paginationEl = document.querySelector('[class*="pagination-0-2-"]');
+        if (paginationEl) {
+          let counterDiffBar = document.body._pekoraCounterDiffBar;
+          if (!counterDiffBar || !counterDiffBar.isConnected) {
+            counterDiffBar = document.createElement("div");
+            counterDiffBar.className = "pekora-counter-diff-bar";
+            counterDiffBar.style.cssText = "display:flex;flex-wrap:nowrap;gap:15px;justify-content:center;align-items:center;padding:8px 0;";
+            paginationEl.insertAdjacentElement("afterend", counterDiffBar);
+            document.body._pekoraCounterDiffBar = counterDiffBar;
+          }
+          if (counterDiffBar.previousElementSibling !== paginationEl) {
+            paginationEl.insertAdjacentElement("afterend", counterDiffBar);
+          }
+          const rapDiff = requestRap - offerRap;
+          const valDiff = requestTotal - offerTotal;
+          const rapPct = offerRap > 0 ? (rapDiff / offerRap) * 100 : 0;
+          const valPct = offerTotal > 0 ? (valDiff / offerTotal) * 100 : 0;
+          counterDiffBar.innerHTML = makePill("RAP", rapDiff, rapPct) + makePill("Value", valDiff, valPct);
+        } else {
+          // No pagination on this layout (e.g. send-trade page) — anchor after the builder column instead
+          let counterDiffBar = document.body._pekoraCounterDiffBar;
+          if (!counterDiffBar || !counterDiffBar.isConnected) {
+            counterDiffBar = document.createElement("div");
+            counterDiffBar.className = "pekora-counter-diff-bar";
+            counterDiffBar.style.cssText = "display:flex;flex-wrap:nowrap;gap:15px;justify-content:center;align-items:center;padding:8px 0;";
+            builderCol.insertAdjacentElement("afterend", counterDiffBar);
+            document.body._pekoraCounterDiffBar = counterDiffBar;
+          }
+          const rapDiff = requestRap - offerRap;
+          const valDiff = requestTotal - offerTotal;
+          const rapPct = offerRap > 0 ? (rapDiff / offerRap) * 100 : 0;
+          const valPct = offerTotal > 0 ? (valDiff / offerTotal) * 100 : 0;
+          counterDiffBar.innerHTML = makePill("RAP", rapDiff, rapPct) + makePill("Value", valDiff, valPct);
+        }
+      }
+
+      // Exclude sections inside elements we hid to make room for the overlay
+      const sections = Array.from(document.querySelectorAll('[class*="section-0-2-"]'))
+        .filter(s => !s.closest('[data-pekora-hidden]'));
+
+      // Remove any stray duplicates beyond one per section
+      document.querySelectorAll(".pekora-korone-val").forEach((el, i) => {
+        if (i >= sections.length) el.remove();
+      });
+
+      const sectionTotals = [];
+
+      for (const section of sections) {
+        const totalRow = section.querySelector('[class*="totalRow"]');
+        if (!totalRow) continue;
+
+        const nameEls = Array.from(section.querySelectorAll('[class*="itemName"]'));
+        let total = 0;
+        let rapTotal = 0;
+        for (const el of nameEls) {
+          const name = (el.textContent || "").trim();
+          if (!name) continue;
+          const card = el.closest('[class*="itemCard"]') || el.parentElement;
+          const rapEl = card && card.querySelector('[class*="itemValue"] [class*="valueCurrencyLabel"]:not(.pekora-item-val *), [class*="itemValue"] [class*="priceLabel"]:not(.pekora-item-val *)');
+          const rap = rapEl ? (parseInt((rapEl.textContent || "").replace(/[^0-9]/g, "")) || 0) : 0;
+          rapTotal += rap;
+
+          const val = lookupValueForNameModal(name);
+          if (typeof val === "number" && val > 0) {
+            total += val;
+          } else {
+            total += rap;
+          }
+
+          // Inject per-item Korone value row under itemValue
+          const itemValueEl = card && card.querySelector('[class*="itemValue"]');
+          if (itemValueEl) {
+            const origItemIcon = itemValueEl.querySelector('[class*="valueCurrencyIcon"]:not(.pekora-robux-icon)');
+            if (origItemIcon && !origItemIcon.dataset.pekoraSvg) {
+              origItemIcon.dataset.pekoraSvg = "1";
+              origItemIcon.className = "pekora-robux-icon";
+              origItemIcon.style.cssText = "display:inline-flex;align-items:center;width:16px;height:16px;margin-right:3px;";
+              origItemIcon.innerHTML = INLINE_ROBUX_SVG.replace('width="24" height="24"', 'width="16" height="16"');
+            }
+          }
+          if (itemValueEl && !card._pekoraItemClone) {
+            const currencyEl = itemValueEl.querySelector('[class*="valueCurrency"]');
+            if (currencyEl) {
+              const itemClone = currencyEl.cloneNode(true);
+              itemClone.classList.add("pekora-item-val");
+              const iconEl = itemClone.querySelector('[class*="valueCurrencyIcon"], .pekora-robux-icon');
+              if (iconEl) {
+                iconEl.className = "pekora-rolimons-icon";
+                iconEl.style.cssText = "display:inline-flex;align-items:center;width:16px;height:16px;margin-right:3px;";
+                iconEl.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1094 1466.2" style="width:16px;height:16px"><path fill="#0084dd" d="M1094 521.6 0 0v469.5l141-67.4 250 119.2L0 707.8v369.7l815.6 388.7L315 893l779-371.4z"></path></svg>`;
+              }
+              const numEl = itemClone.querySelector('[class*="valueCurrencyLabel"], [class*="priceLabel"]');
+              if (numEl) {
+                const displayVal = (typeof val === "number" && val > 0) ? val : rap;
+                numEl.textContent = displayVal.toLocaleString();
+                numEl.style.setProperty("color", "#00b3ff", "important");
+              }
+              const itemId = lookupIdForName(name);
+              if (itemId) {
+                const linkEl = document.createElement("a");
+                linkEl.href = `https://www.koromons.net/item?id=${itemId}`;
+                linkEl.target = "_blank";
+                linkEl.rel = "noopener noreferrer";
+                linkEl.style.cssText = "display:inline-flex;align-items:center;margin-left:4px;opacity:0.7;";
+                linkEl.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" height="21px" viewBox="0 -960 960 960" width="21px" fill="${pekoraGetThemeColors().ink}"><path d="M200-120q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h280v80H200v560h560v-280h80v280q0 33-23.5 56.5T760-120H200Zm188-212-56-56 372-372H560v-80h280v280h-80v-144L388-332Z"/></svg>`;
+                itemClone.appendChild(linkEl);
+              }
+              itemValueEl.appendChild(itemClone);
+              card._pekoraItemClone = itemClone;
+            }
+          } else if (card && card._pekoraItemClone && card._pekoraItemClone.isConnected) {
+            const numEl = card._pekoraItemClone.querySelector('[class*="valueCurrencyLabel"], [class*="priceLabel"]');
+            if (numEl) {
+              const displayVal = (typeof val === "number" && val > 0) ? val : rap;
+              numEl.textContent = displayVal.toLocaleString();
+            }
+          }
+        }
+        sectionTotals.push({ section, total, rapTotal });
+
+        const totalValueEl = totalRow.querySelector('[class*="totalValue"]');
+        if (!totalValueEl) continue;
+
+        // Replace font icon in original row with inline SVG so it can be sized
+        const origIconEl = totalValueEl.querySelector('[class*="valueCurrencyIcon"]');
+        if (origIconEl && !origIconEl.dataset.pekoraSvg) {
+          origIconEl.dataset.pekoraSvg = "1";
+          origIconEl.className = "pekora-robux-icon";
+          origIconEl.style.cssText = "display:inline-flex;align-items:center;width:21px;height:21px;margin-right:4px;";
+          origIconEl.innerHTML = INLINE_ROBUX_SVG.replace('width="24" height="24"', 'width="21" height="21"');
+        }
+
+        // Clone the inner valueCurrency div and append inside totalValue so it inherits right-align
+        let korClone = totalRow._pekoraClone;
+        if (!korClone || !korClone.isConnected) {
+          const currencyEl = totalValueEl.querySelector('[class*="valueCurrency"]');
+          if (!currencyEl) continue;
+          korClone = currencyEl.cloneNode(true);
+          korClone.classList.add("pekora-korone-val");
+          const iconEl = korClone.querySelector('[class*="valueCurrencyIcon"], .pekora-robux-icon');
+          if (iconEl) {
+            iconEl.className = "pekora-rolimons-icon";
+            iconEl.style.cssText = "display:inline-flex;align-items:center;width:21px;height:21px;";
+            iconEl.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1094 1466.2" style="width:21px;height:21px"><path fill="#0084dd" d="M1094 521.6 0 0v469.5l141-67.4 250 119.2L0 707.8v369.7l815.6 388.7L315 893l779-371.4z"></path></svg>`;
+          }
+          totalValueEl.appendChild(korClone);
+          totalRow._pekoraClone = korClone;
+        }
+
+        const numEl = korClone.querySelector('[class*="totalCurrencyLabel"], [class*="priceLabel"]');
+        if (numEl) {
+          numEl.textContent = total.toLocaleString();
+          numEl.style.setProperty("color", "#00b3ff", "important");
+        }
+      }
+
+      if (sectionTotals.length >= 2) {
+        const gave = sectionTotals[0];
+        const received = sectionTotals[1];
+        const rapDiff = received.rapTotal - gave.rapTotal;
+        const valueDiff = received.total - gave.total;
+        const rapPct = gave.rapTotal > 0 ? (rapDiff / gave.rapTotal) * 100 : (rapDiff === 0 ? 0 : -100);
+        const valuePct = gave.total > 0 ? (valueDiff / gave.total) * 100 : (valueDiff === 0 ? 0 : -100);
+
+
+
+        let diffBar = document.body._pekoraDiffBar;
+        if (!diffBar || !diffBar.isConnected) {
+          diffBar = document.createElement("div");
+          diffBar.className = "pekora-diff-bar";
+          diffBar.style.cssText = "display:flex;flex-wrap:nowrap;gap:15px;justify-content:center;align-items:center;box-sizing:border-box;padding:1px;margin:8px 0;";
+          document.body._pekoraDiffBar = diffBar;
+        }
+        if (diffBar.previousElementSibling !== gave.section) {
+          gave.section.insertAdjacentElement("afterend", diffBar);
+        }
+        diffBar.innerHTML = makePill("RAP", rapDiff, rapPct) + makePill("Value", valueDiff, valuePct);
+
+        const refRow = gave.section.querySelector('[class*="totalRow"]');
+        if (refRow) {
+          const rowRect = refRow.getBoundingClientRect();
+          const parentRect = diffBar.parentElement.getBoundingClientRect();
+          diffBar.style.width = rowRect.width + "px";
+          diffBar.style.marginLeft = (rowRect.left - parentRect.left) + "px";
+        }
+      }
+    }
+
+    setInterval(runTradesPageInjector, 200);
+
+  })();
+
+  /* ---------------------------
+     Collectibles Page
+  --------------------------- */
+  (function () {
+    "use strict";
+
+    (function injectCollectiblesCSS() {
+      const css = `
+.col-6.col-md-4.col-lg-2.mb-2 { display: flex !important; align-items: stretch !important; }
+.col-6.col-md-4.col-lg-2.mb-2 .card { height: auto !important; min-height: 100% !important; overflow: visible !important; }
+#pekora-obc-sort-bar button:focus,
+#pekora-obc-sort-bar button:focus-visible {
+  outline: none !important;
+  box-shadow: none !important;
+}
+      `;
+      const st = document.createElement("style");
+      st.textContent = css;
+      document.head.appendChild(st);
+    })();
+
+    function getKoromonValue(id) {
+      const it = ITEMS.find((i) => String(i.itemId) === String(id) || String(i.ItemId) === String(id));
+      return it && (it.Value || it.value) > 0 ? (it.Value || it.value) : 0;
+    }
+
+    function isUaidItem(name) {
+      if (!name) return false;
+      const lower = name.toLowerCase();
+      if (lower.includes("uaid")) return true;
+      const m = name.match(/\b(\d{6,})\b/);
+      if (m && !name.includes("#")) return true;
+      return false;
+    }
+
+    function extractSerial(name) {
+      if (!name) return Infinity;
+      const patterns = [/#\s*(\d+)/, /serial[:\s#]*(\d+)/i, /s\/n[:\s]*(\d+)/i];
+      for (const pat of patterns) {
+        const m = name.match(pat);
+        if (m) return parseInt(m[1], 10);
+      }
+      const parenM = name.match(/\((\d+)\)\s*$/) || name.match(/\[(\d+)\]\s*$/);
+      if (parenM) return parseInt(parenM[1], 10);
+      const tokens = (name.match(/\b(\d+)\b/g) || []).map(Number).filter(n =>
+        n > 0 && n < 100000 && !(n >= 1900 && n <= 2100)
+      );
+      if (tokens.length) return Math.min(...tokens);
+      return Infinity;
+    }
+
+    const ROLIMONS_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1094 1466.2" style="width:17px;height:17px;flex-shrink:0"><path fill="#0084dd" d="M1094 521.6 0 0v469.5l141-67.4 250 119.2L0 707.8v369.7l815.6 388.7L315 893l779-371.4z"></path></svg>`;
+
+    // ── Old-style Collectibles page: fetch every item up front instead of
+    //    relying on the site's own paginated grid, so the whole inventory
+    //    renders on one page. ────────────────────────────────────────────
+    let obcFullLoadDone = false;
+    let obcFullLoadUserId = null;
+
+    function obcEsc(t) {
+      const d = document.createElement("div");
+      d.textContent = t;
+      return d.innerHTML;
+    }
+
+    async function fetchAllCollectibles(userId) {
+      const items = [];
+      let cursor = "";
+      while (true) {
+        const url = `/apisite/inventory/v1/users/${userId}/assets/collectibles?limit=100${cursor ? "&cursor=" + encodeURIComponent(cursor) : ""}`;
+        let data;
+        try {
+          const res = await fetch(url, { credentials: "include" });
+          if (!res.ok) break;
+          data = await res.json();
+        } catch (e) { break; }
+        if (data.data) items.push(...data.data);
+        if (data.nextPageCursor) cursor = data.nextPageCursor;
+        else break;
+      }
+      return items;
+    }
+
+    function renderOldPageCard(i) {
+      return `<div class="col-6 col-md-4 col-lg-2 mb-2"><div class="card bg-dark">
+        <a href="/catalog/${i.assetId}/--"><img class="w-100 mx-auto" src="/thumbs/asset.ashx?assetId=${i.assetId}"></a>
+        <div class="card-body">
+          <p class="mb-0 fw-bolder text-truncate">${obcEsc(i.name)}</p>
+          <p class="mb-0 text-truncate">RAP: ${(i.recentAveragePrice || 0).toLocaleString()}</p>
+          <p class="mb-0 text-truncate">${i.serialNumber ? `Serial: #${i.serialNumber} of -` : `UAID: ${i.userAssetId}`}</p>
+        </div></div></div>`;
+    }
+
+    async function loadFullCollectiblesPage() {
+      const userId = new URLSearchParams(location.search).get("userId");
+      if (!userId) return;
+
+      const pi = new URLSearchParams(location.search).get("pageIndex");
+      if (pi && pi !== "0") {
+        location.href = `/internal/collectibles?userId=${userId}`;
+        return;
+      }
+
+      if (obcFullLoadDone && obcFullLoadUserId === userId) return;
+
+      const row = document.querySelector(".col-12.col-lg-9 .row");
+      const body = document.querySelector("main .card.card-body.bg-dark.text-light");
+      if (!row || !body) return;
+
+      obcFullLoadDone = true;
+      obcFullLoadUserId = userId;
+
+      row.innerHTML = '<div class="col-12 text-center py-4"><div class="spinner-border text-light"></div><p class="mt-2">Loading all collectibles...</p></div>';
+      document.querySelector("main .container.mb-3")?.remove();
+
+      try {
+        const items = (await fetchAllCollectibles(userId)).sort((a, b) => (b.recentAveragePrice || 0) - (a.recentAveragePrice || 0));
+        const totalRap = items.reduce((s, i) => s + (i.recentAveragePrice || 0), 0);
+
+        const rapEl = body.querySelector(".col-12.col-lg-3 p.fw-bolder");
+        if (rapEl) rapEl.textContent = `Total RAP: ${totalRap.toLocaleString()}`;
+
+        row.innerHTML = items.map(renderOldPageCard).join("");
+      } catch (e) {
+        console.error("[pekora] full collectibles load failed", e);
+        obcFullLoadDone = false;
+        row.innerHTML = '<div class="col-12 text-center py-4"><p class="text-danger">Failed to load. Refresh and try again.</p></div>';
+      }
+    }
+
+    function runCollectiblesInjector() {
+      if (!location.href.includes("/internal/collectibles?userId=")) return;
+
+      loadFullCollectiblesPage();
+
+      let totalValue = 0;
+
+      document.querySelectorAll(".col-6.col-md-4.col-lg-2.mb-2").forEach((card) => {
+        try {
+          const link = card.querySelector("a");
+          if (!link) return;
+          const match = link.href.match(/catalog\/(\d+)\//);
+          if (!match) return;
+          const itemId = match[1];
+
+          let rap = 0;
+          const rapEl = card.querySelector(".card-body p:nth-of-type(2)");
+          if (rapEl) {
+            const m = rapEl.textContent.match(/RAP:\s*([\d.,]+)/i);
+            if (m) rap = parseInt(m[1].replace(/[.,]/g, ""), 10);
+          }
+
+          const korVal = getKoromonValue(itemId);
+          const val = korVal > 0 ? korVal : rap;
+          totalValue += val;
+
+          if (!card.querySelector(".pekora-value")) {
+            const p = document.createElement("p");
+            p.className = "pekora-value mb-0 fw-bolder";
+            p.style.cssText = "color:#00b3ff;margin-top:8px;margin-bottom:0;padding-bottom:12px;white-space:nowrap;display:flex;align-items:center;justify-content:center;gap:4px;";
+            p.innerHTML = `${ROLIMONS_SVG}<span>Value: ${val.toLocaleString()}</span>`;
+            const body = card.querySelector(".card-body") || card;
+            body.style.paddingBottom = "0px";
+            body.appendChild(p);
+          }
+
+          const title = card.querySelector(".card-body p.fw-bolder") || card.querySelector(".card-body p");
+          card.dataset.value = val;
+          card.dataset.rap = rap;
+          card.dataset.name = title ? title.textContent.trim() : "";
+          const rawName = card.dataset.name;
+          card.dataset.serial = isUaidItem(rawName) ? "uaid" : String(extractSerial(rawName));
+        } catch (e) {
+          console.debug("collectible card inject error", e);
+        }
+      });
+
+      const rapElement = [...document.querySelectorAll(".fw-bolder")].find((el) => /Total RAP/i.test(el.textContent));
+      if (rapElement) {
+        let valEl = document.querySelector("#pekora-obc-total-value");
+        if (!valEl) {
+          valEl = document.createElement("p");
+          valEl.id = "pekora-obc-total-value";
+          valEl.style.color = "#00b3ff";
+          valEl.style.fontWeight = "700";
+          valEl.style.marginTop = "5px";
+          rapElement.insertAdjacentElement("afterend", valEl);
+        }
+        valEl.textContent = "Total Value: " + totalValue.toLocaleString();
+      }
+
+      insertCollectiblesSortBar();
+    }
+
+    function insertCollectiblesSortBar() {
+      const row = document.querySelector(".col-12.col-lg-9 .row");
+      if (!row) return;
+
+      // Inserted as a normal-flow sibling directly above the card row (same
+      // parent, same width) instead of absolutely positioned against the
+      // whole page container, so its right edge always lines up with the
+      // right edge of the item grid regardless of sidebar width.
+      let bar = document.querySelector("#pekora-obc-sort-bar");
+      if (!bar) {
+        bar = document.createElement("div");
+        bar.id = "pekora-obc-sort-bar";
+        bar.style.cssText = "display:flex;align-items:center;justify-content:flex-end;gap:5px;width:100%;margin-bottom:10px;flex-wrap:wrap;";
+        row.parentElement.insertBefore(bar, row);
+      }
+
+      const makeBtn = (id, text) => {
+        const btn = document.createElement("button");
+        btn.id = id;
+        btn.type = "button";
+        btn.style.cssText = "background:transparent;color:rgba(255,255,255,0.5);border:1px solid rgba(255,255,255,0.15);border-radius:5px;padding:4px 10px;font-size:12px;font-weight:500;cursor:pointer;transition:border-color 0.15s,color 0.15s;white-space:nowrap;";
+        btn.addEventListener("mouseenter", () => { btn.style.borderColor = "rgba(255,255,255,0.35)"; btn.style.color = "#fff"; });
+        btn.addEventListener("mouseleave", () => { btn.style.borderColor = "rgba(255,255,255,0.15)"; btn.style.color = "rgba(255,255,255,0.5)"; });
+        btn.textContent = text;
+        return btn;
+      };
+
+      function sortGrid(type, asc) {
+        const cards = [...row.querySelectorAll(".col-6.col-md-4.col-lg-2.mb-2")];
+        cards.sort((a, b) => {
+          if (type === "name") {
+            const A = (a.dataset.name || "").toLowerCase();
+            const B = (b.dataset.name || "").toLowerCase();
+            return asc ? A.localeCompare(B) : B.localeCompare(A);
+          }
+          const A = Number(a.dataset[type] || 0);
+          const B = Number(b.dataset[type] || 0);
+          return asc ? A - B : B - A;
+        });
+        cards.forEach((c) => row.appendChild(c));
+      }
+
+      function sortBySerial(asc) {
+        const cards = [...row.querySelectorAll(".col-6.col-md-4.col-lg-2.mb-2")];
+
+        function cardRawText(card) { return (card.textContent || "").replace(/\s+/g, " ").trim(); }
+
+        function serialFromCard(card) {
+          const raw = cardRawText(card);
+          const hashM = raw.match(/#\s*(\d+)/);
+          if (hashM) return parseInt(hashM[1], 10);
+          const labelM = raw.match(/(?:serial|s\/n)[:\s#]*(\d+)/i);
+          if (labelM) return parseInt(labelM[1], 10);
+          const parenM = raw.match(/\((\d+)\)/);
+          if (parenM) return parseInt(parenM[1], 10);
+          const allNums = (raw.match(/\b(\d+)\b/g) || [])
+            .map(Number)
+            .filter(n => n > 0 && n < 100000 && !(n >= 1900 && n <= 2100));
+          if (allNums.length) return Math.min(...allNums);
+          return Infinity;
+        }
+
+        function isUaidCard(card) {
+          const raw = cardRawText(card);
+          if (/uaid/i.test(raw)) return true;
+          if (/\b\d{6,}\b/.test(raw) && !/#\s*\d/.test(raw)) return true;
+          return false;
+        }
+
+        function bucket(card) {
+          if (isUaidCard(card)) return 2;
+          const s = serialFromCard(card);
+          return isFinite(s) ? 0 : 1;
+        }
+
+        cards.sort((a, b) => {
+          const bA = bucket(a);
+          const bB = bucket(b);
+          if (bA !== bB) return bA - bB;
+          if (bA !== 0) return 0;
+          const sA = serialFromCard(a);
+          const sB = serialFromCard(b);
+          if (sA !== sB) return asc ? sA - sB : sB - sA;
+          return Number(b.dataset.value || 0) - Number(a.dataset.value || 0);
+        });
+
+        cards.forEach((c) => row.appendChild(c));
+      }
+
+      // ── Stack Dupes ──────────────────────────────────────────────────
+      (function createStackPopup() {
+        if (document.getElementById("pekora-obc-stack-popup")) return;
+
+        const closeModal = () => {
+          document.getElementById("pekora-obc-stack-popup").style.display = "none";
+          document.body.classList.remove("pekora-obc-modal-open");
+        };
+
+        const popup = document.createElement("div");
+        popup.id = "pekora-obc-stack-popup";
+        popup.style.cssText = [
+          "display: none",
+          "position: fixed",
+          "z-index: 2147483647",
+          "top: 50%",
+          "left: 50%",
+          "transform: translate(-50%, -50%)",
+          "background: #1c1c1c",
+          "border: 1px solid rgba(255,255,255,0.12)",
+          "border-radius: 12px",
+          "padding: 20px 24px",
+          "min-width: 220px",
+          "max-width: 320px",
+          "max-height: 80vh",
+          "overflow-y: auto",
+          "box-shadow: 0 8px 40px rgba(0,0,0,0.8)",
+          "font-family: Arial, sans-serif",
+          "font-size: 13px",
+          "color: #e6ffed",
+          "pointer-events: auto",
+        ].join(";");
+        popup.onclick = (e) => e.stopPropagation();
+        const closeBtn = document.createElement("div");
+        closeBtn.textContent = "✕";
+        closeBtn.style.cssText = "position:absolute;top:12px;right:14px;cursor:pointer;font-size:16px;color:rgba(255,255,255,0.5);line-height:1;font-weight:700";
+        closeBtn.onclick = closeModal;
+        popup.appendChild(closeBtn);
+        const title = document.createElement("div");
+        title.id = "pekora-obc-stack-popup-title";
+        title.style.cssText = "font-weight:800;margin-bottom:8px;padding-right:16px;color:#fff;font-size:14px";
+        popup.appendChild(title);
+        const list = document.createElement("div");
+        list.id = "pekora-obc-stack-popup-list";
+        popup.appendChild(list);
+        document.body.appendChild(popup);
+      })();
+
+      function reapplyStackIfActive() {
+        const sb = document.querySelector("#btn-obc-stack-dupes");
+        if (sb && sb.dataset.stacked === "1") {
+          unstackDupes();
+          stackDupes();
+        }
+      }
+
+      function stackDupes() {
+        const cards = [...row.querySelectorAll(".col-6.col-md-4.col-lg-2.mb-2")];
+
+        const groups = new Map();
+        for (const card of cards) {
+          const name = (card.dataset.name || "").trim().toLowerCase();
+          if (!name) continue;
+          if (!groups.has(name)) groups.set(name, []);
+          groups.get(name).push(card);
+        }
+
+        for (const [, group] of groups) {
+          if (group.length < 2) continue;
+
+          const keeper = group[0];
+          const count = group.length;
+
+          for (let i = 1; i < group.length; i++) {
+            // Our own injectCollectiblesCSS rule forces "display: flex !important"
+            // on this same selector (so cards fit their content) — a plain
+            // inline "none" loses to that !important, so this needs important too.
+            group[i].style.setProperty("display", "none", "important");
+            group[i].dataset.pekoraStacked = "1";
+          }
+
+          let badge = keeper.querySelector(".pekora-dupe-badge");
+          if (!badge) {
+            badge = document.createElement("div");
+            badge.className = "pekora-dupe-badge";
+            badge.style.cssText = [
+              "position: absolute",
+              "top: 5px",
+              "right: 5px",
+              "background: #2a2a2a",
+              "color: rgba(255,255,255,0.75)",
+              "font-size: 11px",
+              "font-weight: 700",
+              "padding: 2px 7px",
+              "border-radius: 5px",
+              "border: 1px solid rgba(255,255,255,0.12)",
+              "pointer-events: none",
+              "z-index: 10",
+              "letter-spacing: 0.03em",
+            ].join(";");
+            const prev = keeper.style.position;
+            if (!prev || prev === "static" || prev === "") keeper.style.position = "relative";
+            keeper.appendChild(badge);
+          }
+          badge.textContent = `x${count}`;
+          keeper.dataset.pekoraIsKeeper = "1";
+
+          const entries = group.map(card => {
+            const text = (card.textContent || "").replace(/\s+/g, " ").trim();
+            const uaidM = text.match(/UAID[:\s]*([0-9]{4,})/i);
+            if (uaidM) return "UAID: " + uaidM[1];
+            const serialM = text.match(/#\s*([0-9]+)/);
+            if (serialM) return "#" + serialM[1];
+            const labelM = text.match(/Serial[:\s#]*([0-9]+)/i);
+            if (labelM) return "#" + labelM[1];
+            return card.dataset.name || "Unknown";
+          });
+
+          const cardBody = keeper.querySelector(".card-body") || keeper;
+          let uaidBtn = keeper.querySelector(".pekora-uaid-btn");
+          if (!uaidBtn) {
+            uaidBtn = document.createElement("button");
+            uaidBtn.className = "pekora-uaid-btn";
+            uaidBtn.type = "button";
+            uaidBtn.style.cssText = [
+              "display: block",
+              "margin: 6px auto 0 auto",
+              "background: transparent",
+              "color: rgba(255,255,255,0.5)",
+              "border: 1px solid rgba(255,255,255,0.15)",
+              "border-radius: 5px",
+              "font-size: 10px",
+              "font-weight: 600",
+              "padding: 2px 8px",
+              "cursor: pointer",
+              "letter-spacing: 0.03em",
+              "white-space: nowrap",
+            ].join(";");
+            cardBody.appendChild(uaidBtn);
+          }
+          uaidBtn.textContent = `View serials (${count})`;
+          uaidBtn._pekoraEntries = entries;
+          uaidBtn._pekoraName = keeper.dataset.name || "";
+          uaidBtn.onclick = (e) => {
+            e.stopPropagation();
+            const popup = document.getElementById("pekora-obc-stack-popup");
+            const title = document.getElementById("pekora-obc-stack-popup-title");
+            const list = document.getElementById("pekora-obc-stack-popup-list");
+            title.textContent = uaidBtn._pekoraName;
+            list.innerHTML = "";
+            uaidBtn._pekoraEntries.forEach(entry => {
+              const entryRow = document.createElement("div");
+              entryRow.style.cssText = "padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.06);color:#e6ffed;font-size:12px";
+              entryRow.textContent = entry;
+              list.appendChild(entryRow);
+            });
+            const last = list.lastElementChild;
+            if (last) last.style.borderBottom = "none";
+            popup.style.display = "block";
+            document.body.classList.add("pekora-obc-modal-open");
+          };
+        }
+      }
+
+      function unstackDupes() {
+        row.querySelectorAll(".col-6.col-md-4.col-lg-2.mb-2[data-pekora-stacked='1']").forEach(card => {
+          card.style.display = "";
+          delete card.dataset.pekoraStacked;
+        });
+        row.querySelectorAll(".pekora-dupe-badge").forEach(b => b.remove());
+        row.querySelectorAll(".pekora-uaid-btn").forEach(b => b.remove());
+        row.querySelectorAll(".col-6.col-md-4.col-lg-2.mb-2[data-pekora-is-keeper='1']").forEach(card => {
+          delete card.dataset.pekoraIsKeeper;
+        });
+        const popup = document.getElementById("pekora-obc-stack-popup");
+        if (popup) popup.style.display = "none";
+        document.body.classList.remove("pekora-obc-modal-open");
+      }
+
+      if (!document.querySelector("#btn-obc-sort-value")) {
+        const btn = makeBtn("btn-obc-sort-value", "Value ↓");
+        btn.onclick = () => {
+          const asc = !(btn.dataset.asc === "1");
+          btn.dataset.asc = asc ? "1" : "0";
+          btn.textContent = asc ? "Value ↑" : "Value ↓";
+          sortGrid("value", asc);
+          reapplyStackIfActive();
+        };
+        bar.appendChild(btn);
+      }
+
+      if (!document.querySelector("#btn-obc-sort-rap")) {
+        const btn = makeBtn("btn-obc-sort-rap", "RAP ↓");
+        btn.onclick = () => {
+          const asc = !(btn.dataset.asc === "1");
+          btn.dataset.asc = asc ? "1" : "0";
+          btn.textContent = asc ? "RAP ↑" : "RAP ↓";
+          sortGrid("rap", asc);
+          reapplyStackIfActive();
+        };
+        bar.appendChild(btn);
+      }
+
+      if (!document.querySelector("#btn-obc-sort-serial")) {
+        const btn = makeBtn("btn-obc-sort-serial", "Serial #↑");
+        btn.onclick = () => {
+          const asc = !(btn.dataset.asc === "1");
+          btn.dataset.asc = asc ? "1" : "0";
+          btn.textContent = asc ? "Serial #↑" : "Serial #↓";
+          sortBySerial(asc);
+          reapplyStackIfActive();
+        };
+        bar.appendChild(btn);
+      }
+
+      if (!document.querySelector("#btn-obc-stack-dupes")) {
+        const btn = makeBtn("btn-obc-stack-dupes", "Stack Dupes");
+        btn.dataset.stacked = "0";
+        btn.onclick = () => {
+          const isStacked = btn.dataset.stacked === "1";
+          if (isStacked) {
+            btn.dataset.stacked = "0";
+            btn.textContent = "Stack Dupes";
+            unstackDupes();
+          } else {
+            btn.dataset.stacked = "1";
+            btn.textContent = "Unstack";
+            stackDupes();
+          }
+        };
+        bar.appendChild(btn);
+        // Lock the width to the longer label ("Stack Dupes") so it doesn't
+        // shrink when it toggles to the shorter "Unstack" text.
+        requestAnimationFrame(() => {
+          btn.style.minWidth = btn.offsetWidth + "px";
+        });
+      }
+    }
+
+    (async function () {
+      await loadKoromons();
+      runCollectiblesInjector();
+      setInterval(runCollectiblesInjector, 300);
+    })();
+
+  })();
+
+  /* ---------------------------
+     Legacy Trade Modal
+     ("Trade Request" popup over the old My Transactions / Summary /
+     Trade Items table view — a totally different component tree from
+     the modern /trades React page, so none of the selectors above
+     apply here. Detected by presence, not URL, since we don't know
+     what page(s) it can appear on.)
+  --------------------------- */
+  (function () {
+    "use strict";
+
+    const LEGACY_ROLIMONS_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1094 1466.2" style="width:15px;height:15px;flex-shrink:0"><path fill="#0084dd" d="M1094 521.6 0 0v469.5l141-67.4 250 119.2L0 707.8v369.7l815.6 388.7L315 893l779-371.4z"></path></svg>`;
+
+    (function injectLegacyTradeCSS() {
+      const css = `[class*="col-0-2-"]:hover .pekora-legacy-value { display: none !important; }`;
+      const st = document.createElement("style");
+      st.textContent = css;
+      document.head.appendChild(st);
+    })();
+
+    function pekoraLegacyProcessItemRow(row, sectionState) {
+      row.querySelectorAll('[class*="itemName-0-2-"]').forEach((nameEl) => {
+        try {
+          const name = (nameEl.textContent || "").trim();
+          if (!name) return;
+
+          const val = lookupValueForNameModal(name);
+          if (typeof val === "number" && val > 0) {
+            sectionState.sawAny = true;
+            sectionState.total += val;
+          }
+
+          if (nameEl.dataset.pekoraLegacyDone) return;
+          nameEl.dataset.pekoraLegacyDone = "1";
+          if (typeof val !== "number" || val <= 0) return;
+
+          // Placed under the item's slot box (col-0-2-N — the hash suffix isn't
+          // stable so we match by prefix), not inside it: absolutely positioned
+          // just below the box rather than appended in normal flow, so it can't
+          // squeeze into the row as an extra flex item, and overflow is forced
+          // visible so the box's own clipping doesn't hide it.
+          const box = nameEl.closest('[class*="col-0-2-"]') || nameEl.parentElement;
+          const cs = getComputedStyle(box);
+          if (cs.position === "static") box.style.setProperty("position", "relative", "important");
+          box.style.setProperty("overflow", "visible", "important");
+
+          const badge = document.createElement("div");
+          badge.className = "pekora-legacy-value";
+          badge.style.cssText = "position:absolute;left:0;right:0;top:100%;margin-top:2px;color:#0084dd !important;font-weight:700;font-size:14px;white-space:nowrap;display:flex;align-items:center;justify-content:center;gap:4px;pointer-events:none;z-index:5;";
+          badge.innerHTML = `${LEGACY_ROLIMONS_SVG}<span style="color:#0084dd !important;">${val.toLocaleString()}</span>`;
+          box.appendChild(badge);
+        } catch (e) {
+          console.debug("[pekora] legacy trade item inject error", e);
+        }
+      });
+    }
+
+    function pekoraLegacyFlushSection(labelEl, sectionState) {
+      if (!labelEl) return;
+      if (labelEl.textContent !== "Total RAP") labelEl.textContent = "Total RAP";
+
+      const valueP = labelEl.closest('[class*="value-0-2-"]') || labelEl.parentElement;
+      if (valueP.style.marginTop !== "-4px") valueP.style.marginTop = "-4px";
+      valueP.style.setProperty("font-size", "13px", "important");
+
+      const robuxLabelEl = valueP.querySelector('[class*="robuxLabel-0-2-"]');
+      if (robuxLabelEl) {
+        const n = Number((robuxLabelEl.textContent || "").replace(/[^0-9.-]/g, ""));
+        if (isFinite(n)) {
+          sectionState.rap = n;
+          robuxLabelEl.textContent = n.toLocaleString();
+        }
+      }
+
+      if (!sectionState.sawAny) return;
+      // Checked against this specific value line's own next sibling (not a
+      // section-wide query) since Give and Receive use the identical class
+      // name on their own separate <p> elements — a broad query would find
+      // either side's total line instead of just this one's.
+      let totalLine = valueP.nextElementSibling && valueP.nextElementSibling.classList.contains("pekora-legacy-total-value")
+        ? valueP.nextElementSibling
+        : null;
+
+      if (!totalLine) {
+        // Absolutely positioned below valueP instead of relying on normal
+        // block stacking — whatever parent layout keeps "Total RAP" and our
+        // line on the same row (likely a flex row on the col-4 wrapper)
+        // would otherwise pull this sibling in beside it instead of under.
+        // insertAdjacentElement("afterend") makes totalLine a SIBLING of
+        // valueP, not a child, so it's valueP's own parent that needs to be
+        // the positioned ancestor here — not valueP itself.
+        const posParent = valueP.parentElement;
+        const cs = getComputedStyle(posParent);
+        if (cs.position === "static") posParent.style.setProperty("position", "relative", "important");
+
+        totalLine = document.createElement("div");
+        totalLine.className = "pekora-legacy-total-value";
+        // "top:100%" would be 100% of posParent's own height, which turned
+        // out to be much taller than just the "Total RAP" line (likely
+        // stretched to match its row), pushing this way further down than
+        // intended. Anchoring to valueP's actual bottom edge in pixels
+        // instead guarantees it sits directly under the text regardless of
+        // how tall the surrounding column really is.
+        totalLine.style.cssText = "position:absolute;font-weight:700;font-size:13px;white-space:nowrap;display:flex;flex-wrap:nowrap;align-items:center;justify-content:flex-start;gap:4px;";
+        totalLine.style.top = (valueP.offsetTop + valueP.offsetHeight + 2) + "px";
+        // Left-aligned to valueP's own left edge (the "T" in "Total RAP"),
+        // not the parent's, since valueP itself may be inset/padded within it.
+        totalLine.style.left = valueP.offsetLeft + "px";
+        totalLine.innerHTML = `<span style="white-space:nowrap;">Total Value:</span>${LEGACY_ROLIMONS_SVG}<span style="white-space:nowrap;color:#0084dd;"></span>`;
+        valueP.insertAdjacentElement("afterend", totalLine);
+      }
+      // Update the number in place every pass (instead of only on creation)
+      // so a stale/wrong total from an earlier buggy computation gets
+      // corrected rather than permanently left behind.
+      const numEl = totalLine.querySelector("span:last-child");
+      if (numEl) numEl.textContent = sectionState.total.toLocaleString();
+    }
+
+    function pekoraLegacyMakePill(label, diff, pct) {
+      const isGain = diff >= 0;
+      const arrowColor = isGain ? "rgb(43, 191, 90)" : "rgb(215, 32, 32)";
+      const sign = diff >= 0 ? "+" : "-";
+      const arrowPath = isGain
+        ? `<path fill="currentColor" d="M9 4h6v8h4.84L12 19.84L4.16 12H9V4Z"></path>`
+        : `<path fill="currentColor" d="M15 20H9v-8H4.16L12 4.16L19.84 12H15v8Z"></path>`;
+      return `<div style="height:26px;background-color:rgb(220,220,220);align-items:center;padding:4px 10px;display:flex;justify-content:center;font-size:13px;font-weight:600;white-space:nowrap;color:#000000;"><svg xmlns="http://www.w3.org/2000/svg" style="margin-right:3px;color:${arrowColor};flex-shrink:0;" width="22" height="22" viewBox="0 0 24 24"><g transform="translate(0 24) scale(1 -1)">${arrowPath}</g></svg><span style="color:#000000;">${sign}${Math.abs(diff).toLocaleString()} ${label} (${sign}${Math.abs(pct).toFixed(0)}%)</span></div>`;
+    }
+
+    function pekoraLegacyInsertDiffPills(dividerRow, give, receive) {
+      const rapDiff = (receive.rap || 0) - (give.rap || 0);
+      const valueDiff = (receive.total || 0) - (give.total || 0);
+      const rapPct = give.rap > 0 ? (rapDiff / give.rap) * 100 : (rapDiff === 0 ? 0 : (rapDiff > 0 ? 100 : -100));
+      const valuePct = give.total > 0 ? (valueDiff / give.total) * 100 : (valueDiff === 0 ? 0 : (valueDiff > 0 ? 100 : -100));
+
+      let pillRow = dividerRow.parentElement.querySelector(".pekora-legacy-diff-pills");
+      if (!pillRow) {
+        pillRow = document.createElement("div");
+        pillRow.className = "pekora-legacy-diff-pills";
+        pillRow.style.cssText = "display:flex;justify-content:center;gap:10px;padding:6px 0;width:100%;";
+        dividerRow.insertAdjacentElement("afterend", pillRow);
+      }
+      pillRow.innerHTML = pekoraLegacyMakePill("RAP", rapDiff, rapPct) + pekoraLegacyMakePill("Value", valueDiff, valuePct);
+    }
+
+    function pekoraLegacyEnsureModalHeight() {
+      const modalWrapper = document.querySelector('[class*="modalWrapper-0-2-"]');
+      const innerSection = document.querySelector('[class*="innerSection-0-2-"]');
+      if (!modalWrapper || !innerSection || modalWrapper.dataset.pekoraHeightBumped) return;
+      modalWrapper.dataset.pekoraHeightBumped = "1";
+
+      // Enough extra room for the new diff-pills row (the value/badge lines
+      // don't need this — they're absolutely positioned, so they don't take
+      // up flow space — but the pill row is a real sibling that pushes
+      // everything below it down).
+      const EXTRA = 50;
+
+      const curH = parseFloat(modalWrapper.style.height) || modalWrapper.offsetHeight;
+      modalWrapper.style.height = (curH + EXTRA) + "px";
+
+      const curInnerH = parseFloat(innerSection.style.height) || innerSection.offsetHeight;
+      innerSection.style.height = (curInnerH + EXTRA) + "px";
+
+      // margin-top is a vertical-centering trick (roughly -height/2 + 50vh)
+      // calculated for the original shorter height — shift it up by half of
+      // whatever we just added so the taller modal stays centered instead
+      // of drifting down.
+      const m = (modalWrapper.style.marginTop || "").match(/calc\((-?[\d.]+)px\s*\+\s*50vh\)/);
+      if (m) {
+        const base = parseFloat(m[1]);
+        modalWrapper.style.marginTop = `calc(${base - EXTRA / 2}px + 50vh)`;
+      }
+
+      // Nudge the Accept/Counter/Decline button row down a touch so it isn't
+      // sitting right up against the diff pills / receive items above it.
+      const acceptBtn = document.querySelector('[class*="acceptButton-0-2-"]');
+      const buttonRow = acceptBtn ? acceptBtn.closest(".row") : null;
+      if (buttonRow) {
+        const curMt = parseFloat(getComputedStyle(buttonRow).marginTop) || 0;
+        buttonRow.style.marginTop = (curMt + 12) + "px";
+      }
+    }
+
+    function runLegacyTradeInjector() {
+      // There's no wrapper distinguishing "Give" rows from "Receive" rows —
+      // the heading, its value line, and its item row are just flat sibling
+      // <div class="row"> elements under one shared parent, with Receive's
+      // identical trio immediately after. So instead of trying to select a
+      // per-side container (there isn't one), walk the siblings in document
+      // order and track which side we're currently on as we go.
+      const giveHeading = [...document.querySelectorAll("p")].find(
+        (el) => el.children.length === 0 && /ITEMS YOU WILL GIVE/i.test(el.textContent || "")
+      );
+      if (!giveHeading) return;
+
+      pekoraLegacyEnsureModalHeight();
+
+      const headingRow = giveHeading.closest(".row");
+      const container = headingRow ? headingRow.parentElement : null;
+      if (!container) return;
+
+      let mode = null;
+      const sides = { give: null, receive: null };
+      let dividerRow = null;
+
+      Array.from(container.children).forEach((row) => {
+        const text = row.textContent || "";
+        if (/ITEMS YOU WILL GIVE/i.test(text) && row.querySelector('[class*="valueLabel-0-2-"]')) {
+          mode = "give";
+          sides.give = { labelEl: row.querySelector('[class*="valueLabel-0-2-"]'), total: 0, sawAny: false, rap: 0 };
+        } else if (/ITEMS YOU WILL RECEIVE/i.test(text) && row.querySelector('[class*="valueLabel-0-2-"]')) {
+          mode = "receive";
+          sides.receive = { labelEl: row.querySelector('[class*="valueLabel-0-2-"]'), total: 0, sawAny: false, rap: 0 };
+        } else if (row.querySelector(".divider-top")) {
+          dividerRow = row;
+          const dividerLine = row.querySelector(".col-12.divider-top.mb-2");
+          if (dividerLine) dividerLine.style.setProperty("display", "none", "important");
+        } else if (mode && row.querySelector('[class*="itemName-0-2-"]')) {
+          pekoraLegacyProcessItemRow(row, sides[mode]);
+        }
+      });
+
+      if (sides.give) pekoraLegacyFlushSection(sides.give.labelEl, sides.give);
+      if (sides.receive) pekoraLegacyFlushSection(sides.receive.labelEl, sides.receive);
+
+      if (sides.give && sides.receive && dividerRow) {
+        pekoraLegacyInsertDiffPills(dividerRow, sides.give, sides.receive);
+      }
+    }
+
+    (async function () {
+      await loadKoromons();
+      setInterval(runLegacyTradeInjector, 300);
+    })();
+
+  })();
+
+})();
