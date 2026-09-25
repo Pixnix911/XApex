@@ -8,11 +8,10 @@
 // @match        https://www.pekora.pro/*
 // @grant        GM_xmlhttpRequest
 // @connect      raw.githubusercontent.com
+// @connect      pekoramons.lol
 // @connect      www.pekoramons.lol
 // @connect      pekora.pro
 // @connect      www.pekora.pro
-// @connect      www.pekoramons.lol
-// @connect      pekoramons.lol
 // @run-at       document-idle
 // @icon         https://pekora.pro/favicon.ico
 // ==/UserScript==
@@ -20,10 +19,23 @@
 (function () {
   "use strict";
 
-  const VALUES_JSON_URL = "https://www.pekoramons.lol/items.json";
+  // ---- pekoramons.lol API -------------------------------------------------
+  // Docs: Name/Value/Acronym/… catalog, lazy per-name value lookup, and a
+  // resolver for typed queries (name / id / acronym).
+  const PEKORAMONS_BASE = "https://pekoramons.lol";
+  const VALUES_JSON_URL = PEKORAMONS_BASE + "/api/items";
   const FALLBACK_VALUES_JSON_URL = "https://raw.githubusercontent.com/unitedbygrief/koronevalues/main/valu.json";
+  const ITEM_VALUE_API_PREFIX = PEKORAMONS_BASE + "/api/items/name/";
+  const ITEM_SEARCH_API = PEKORAMONS_BASE + "/api/items/search";
+  // -------------------------------------------------------------------------
+
   let ITEMS = [];
-  let NAME_VALUE_MAP = new Map();
+  // cleanedName -> numeric value, populated lazily from ITEM_VALUE_API_PREFIX.
+  const NAME_VALUE_MAP = new Map();
+  // cleanedName -> Promise while a request for that name is in flight.
+  const _pekoraValueInFlight = new Map();
+  // cleanedName -> already asked the API and it had no value (don't re-ask).
+  const _pekoraValueMisses = new Set();
   let NAME_ID_MAP = new Map();
   let NAME_ACRONYM_MAP = new Map();
   let FETCHED = false;
@@ -38,6 +50,7 @@
           onload(res) {
             try {
               const parsed = JSON.parse(res.responseText);
+              // /api/items returns a bare array; the GitHub fallback also does.
               if (!Array.isArray(parsed) || parsed.length === 0) {
                 reject(new Error(`Empty or invalid values JSON from ${url}`));
                 return;
@@ -57,6 +70,32 @@
     });
   }
 
+  // Cross-origin JSON fetch against pekoramons.lol. Uses GM_xmlhttpRequest so
+  // CORS doesn't matter (the userscript runs on pekora.pro but talks to
+  // pekoramons.lol). Falls back to a plain fetch() if GM is unavailable.
+  function pekoraFetchPekoramonsJson(url) {
+    return new Promise((resolve, reject) => {
+      try {
+        GM_xmlhttpRequest({
+          method: "GET",
+          url,
+          headers: { Accept: "application/json" },
+          onload(res) {
+            try { resolve(JSON.parse(res.responseText)); }
+            catch (e) { reject(e); }
+          },
+          onerror(err) { reject(err); },
+        });
+      } catch (e) {
+        // GM_xmlhttpRequest not available — try a normal fetch as a last resort.
+        fetch(url, { credentials: "omit" })
+          .then(r => r.json())
+          .then(resolve)
+          .catch(reject);
+      }
+    });
+  }
+
   let _loadKoromonsPromise = null;
 
   async function loadKoromons() {
@@ -64,10 +103,7 @@
     // resolves — without caching the in-flight promise, any caller that
     // invokes loadKoromons() while the first fetch is still pending would
     // hit this early return with ITEMS still empty, instead of actually
-    // waiting for real data (each page's setInterval loop would eventually
-    // pick up the real values on a later tick regardless, but anything
-    // gated behind a "run once" flag — e.g. per-section total lines — would
-    // permanently see empty data and never retry).
+    // waiting for real data.
     if (FETCHED) return _loadKoromonsPromise;
     FETCHED = true;
     _loadKoromonsPromise = (async () => {
@@ -97,18 +133,111 @@
       .toLowerCase();
   }
 
+  // Fetches https://pekoramons.lol/api/items/name/:itemName for a single
+  // item name and caches the returned Value in NAME_VALUE_MAP. Deduplicated:
+  // concurrent calls for the same name share one request, and names already
+  // known (or already asked and found to have no value) are skipped entirely.
+  function pekoraEnsureItemValue(rawName) {
+    const name = (rawName == null ? "" : String(rawName)).trim();
+    if (!name) return Promise.resolve();
+    const key = cleanNameForLookup(name);
+    if (!key) return Promise.resolve();
+    if (NAME_VALUE_MAP.has(key) || _pekoraValueMisses.has(key)) return Promise.resolve();
+    if (_pekoraValueInFlight.has(key)) return _pekoraValueInFlight.get(key);
+
+    const p = (async () => {
+      try {
+        const data = await pekoraFetchPekoramonsJson(
+          ITEM_VALUE_API_PREFIX + encodeURIComponent(name)
+        );
+        const v = Number(data && (data.Value !== undefined ? data.Value : data.value));
+        if (isFinite(v)) {
+          NAME_VALUE_MAP.set(key, v);
+          return;
+        }
+        _pekoraValueMisses.add(key);
+      } catch (e) {
+        // Network/parse failure — remember the miss so the 200ms interval
+        // doesn't hammer the endpoint with the same name forever.
+        _pekoraValueMisses.add(key);
+      } finally {
+        _pekoraValueInFlight.delete(key);
+      }
+    })();
+
+    _pekoraValueInFlight.set(key, p);
+    return p;
+  }
+
+  // Awaitable variant: resolves to the numeric value for a name (or undefined
+  // if the API has none). Used where a one-shot computation needs the real
+  // value rather than the RAP fallback.
+  async function awaitValueForName(rawName) {
+    const name = (rawName == null ? "" : String(rawName)).trim();
+    if (!name) return undefined;
+
+    const cached = lookupValueForNameModal(name);
+    if (typeof cached === "number") return cached;
+
+    const stripped = name.replace(/\(.*?\)|\[.*?\]|\{.*?\}/g, "").trim();
+    await Promise.all([
+      pekoraEnsureItemValue(name),
+      (stripped && stripped !== name) ? pekoraEnsureItemValue(stripped) : Promise.resolve(),
+    ]);
+    return lookupValueForNameModal(name);
+  }
+
+  // Async resolver backed by /api/items/search?q=… Returns the canonical
+  // item name for a query (name / id / acronym), or null if the API has no
+  // match. Deduplicated per-query so the 200 ms search loop can't spam it.
+  const _pekoraSearchResolveCache = new Map();
+  function pekoraResolveQueryToName(query) {
+    const q = (query || "").trim();
+    if (!q) return Promise.resolve(null);
+    const key = q.toLowerCase();
+    if (_pekoraSearchResolveCache.has(key)) return _pekoraSearchResolveCache.get(key);
+
+    const p = (async () => {
+      try {
+        const data = await pekoraFetchPekoramonsJson(
+          ITEM_SEARCH_API + "?q=" + encodeURIComponent(q)
+        );
+        if (!data) return null;
+        const name = data.Name || data.name;
+        return name ? String(name) : null;
+      } catch (e) {
+        return null;
+      }
+    })();
+
+    _pekoraSearchResolveCache.set(key, p);
+    return p;
+  }
+
+  // Fires the API resolve in the background and stashes the resulting value
+  // in NAME_VALUE_MAP if it came with one. Purely opportunistic — the local
+  // filter stays synchronous.
+  function pekoraPrimeSearchCache(query) {
+    const q = (query || "").trim();
+    if (!q) return;
+    pekoraResolveQueryToName(q).then((name) => {
+      if (!name) return;
+      pekoraEnsureItemValue(name);
+    });
+  }
+
   function buildNameValueMap() {
-    NAME_VALUE_MAP = new Map();
+    // NOTE: NAME_VALUE_MAP is intentionally NOT built from the catalog any
+    // more — it's a lazily-filled cache backed by /api/items/name/:itemName.
     NAME_ID_MAP = new Map();
     NAME_ACRONYM_MAP = new Map();
     if (!Array.isArray(ITEMS)) return;
     for (const it of ITEMS) {
       const n = (it.Name || it.name || it.title || "").toString();
       if (!n) continue;
-      const v = (typeof it.Value !== "undefined" ? Number(it.Value) : (typeof it.value !== "undefined" ? Number(it.value) : 0));
       const key = cleanNameForLookup(n);
-      NAME_VALUE_MAP.set(key, isFinite(v) ? v : 0);
-      if (it.itemId) NAME_ID_MAP.set(key, it.itemId);
+      const id = it.itemId || it.ItemId || it.id;
+      if (id) NAME_ID_MAP.set(key, id);
       const acr = (it.Acronym || it.acronym || "").toString().trim().toLowerCase();
       if (acr && acr !== "n/a" && acr !== "") NAME_ACRONYM_MAP.set(acr, key);
     }
@@ -127,9 +256,17 @@
     if (!rawName) return undefined;
     const name = String(rawName).trim();
     const cleaned = cleanNameForLookup(name);
-    if (NAME_VALUE_MAP.has(cleaned)) return NAME_VALUE_MAP.get(cleaned);
     const stripped = name.replace(/\(.*?\)|\[.*?\]|\{.*?\}/g, "").trim();
     const cleanedStripped = cleanNameForLookup(stripped);
+
+    // Queue the exact name (and its stripped form) with the API *before* the
+    // fuzzy pass below, so a partial cache key can't win over the item's real
+    // value once the request resolves on a later 200ms tick. Cheap no-op when
+    // the name is already cached / in flight / known to have no value.
+    pekoraEnsureItemValue(name);
+    if (cleanedStripped && cleanedStripped !== cleaned) pekoraEnsureItemValue(stripped);
+
+    if (NAME_VALUE_MAP.has(cleaned)) return NAME_VALUE_MAP.get(cleaned);
     if (cleanedStripped && NAME_VALUE_MAP.has(cleanedStripped)) return NAME_VALUE_MAP.get(cleanedStripped);
 
     for (const [k, v] of NAME_VALUE_MAP.entries()) {
@@ -388,7 +525,7 @@ ${obcTextRule}
       .then(r => r.json()).then(d => { if (d && d.id && !loggedInUserId) loggedInUserId = d.id; })
       .catch(() => {});
 
-    function computeTradeOffers(data) {
+    async function computeTradeOffers(data) {
       if (!data || !data.offers || data.offers.length < 2) return null;
       // Identify my offer: if we know logged-in user ID, use it directly
       // Otherwise fall back to assuming data.user is the partner
@@ -404,17 +541,19 @@ ${obcTextRule}
       }
       if (!partnerOffer || !myOffer) return null;
 
-      const sumOffer = (offer) => {
+      // Values now come from pekoramons.lol/api/items/name/:itemName, so this
+      // is async — each asset name is awaited (cached after the first hit)
+      // instead of relying on a pre-loaded map.
+      const sumOffer = async (offer) => {
         let val = 0;
         for (const a of (offer.userAssets || [])) {
           const r = a.recentAveragePrice || 0;
-          const v = lookupValueForNameModal(a.name);
+          const v = await awaitValueForName(a.name);
           val += (typeof v === "number" && v > 0) ? v : r;
         }
         return val;
       };
-      const giveVal = sumOffer(myOffer);
-      const recvVal = sumOffer(partnerOffer);
+      const [giveVal, recvVal] = await Promise.all([sumOffer(myOffer), sumOffer(partnerOffer)]);
       return { giveVal, recvVal };
     }
 
@@ -427,7 +566,7 @@ ${obcTextRule}
         if (data.offers) {
           for (const o of data.offers) if (o.user) tradePartnerMap[o.user.name.toLowerCase()] = o.user.id;
         }
-        const diff = computeTradeOffers(data);
+        const diff = await computeTradeOffers(data);
         if (diff) tradeDiffCache[tradeId] = { ...diff, fetched: true };
       } catch(e) {}
     }
@@ -445,7 +584,10 @@ ${obcTextRule}
       } catch(e) {}
     }
     (function waitForValues() {
-      if (NAME_VALUE_MAP.size > 0) { loadTradeList(); }
+      // NAME_VALUE_MAP is now a lazy API-backed cache that starts empty, so
+      // wait for the item *metadata* load instead (ITEMs feed the acronym map
+      // and pekoramons.lol links). Values resolve on their own per name.
+      if (FETCHED) { loadTradeList(); }
       else { setTimeout(waitForValues, 300); }
     })();
 
@@ -482,8 +624,9 @@ ${obcTextRule}
               const data = JSON.parse(xhr.responseText);
               if (data.offers) {
                 for (const o of data.offers) if (o.user) tradePartnerMap[o.user.name.toLowerCase()] = o.user.id;
-                const diff = computeTradeOffers(data);
-                if (diff) tradeDiffCache[data.id] = { ...diff, fetched: true };
+                computeTradeOffers(data).then(diff => {
+                  if (diff) tradeDiffCache[data.id] = { ...diff, fetched: true };
+                }).catch(() => {});
               }
             }
           } catch(e) {}
@@ -880,7 +1023,7 @@ ${obcTextRule}
           const partnerName = match[1].trim();
           const partnerId = tradePartnerMap[partnerName.toLowerCase()];
           if (partnerId) {
-            const expectedHref = `https://www.koromons.net/player?id=${partnerId}`;
+            const expectedHref = `${PEKORAMONS_BASE}/player?id=${partnerId}`;
             let linkEl = titleEl.querySelector(".pekora-title-link");
             if (!linkEl) {
               linkEl = document.createElement("a");
@@ -954,6 +1097,10 @@ ${obcTextRule}
         let searchPage = 0;
         let currentMatches = [];
         const PAGE_SIZE = 10;
+        // Items added in this session — kept outside renderPage so a re-render
+        // (e.g. after lazy value fetches resolve) doesn't lose the checkmarks.
+        const selectedIds = new Set();
+        let searchRefreshTimer = null;
 
         function getSectionUserId() {
           if (sIdx === 0) return loggedInUserId;
@@ -1023,7 +1170,8 @@ ${obcTextRule}
                 <span>${displayVal.toLocaleString()}</span>
               </div>
             `;
-            let isSelected = false;
+            const idKey = String(id);
+            pekoraToggleSelectedLook(btn, selectedIds.has(idKey));
             btn.addEventListener("click", () => {
               const added = pekoraAddItemDirect(grid, item);
               // Keep the search open either way (don't reveal the native grid,
@@ -1031,8 +1179,9 @@ ${obcTextRule}
               // offerable pool) so you can keep adding more matches without
               // any visual jump.
               if (added) {
-                isSelected = !isSelected; // onToggleItem toggles both ways
-                pekoraToggleSelectedLook(btn, isSelected);
+                if (selectedIds.has(idKey)) selectedIds.delete(idKey);
+                else selectedIds.add(idKey);
+                pekoraToggleSelectedLook(btn, selectedIds.has(idKey));
               } else {
                 console.warn(`[pekora] couldn't add "${name}" — see warning above for details`);
               }
@@ -1043,6 +1192,20 @@ ${obcTextRule}
           spLabel.textContent = `Page ${searchPage + 1} of ${totalPages}`;
           spPrev.disabled = searchPage === 0;
           spNext.disabled = searchPage + 1 >= totalPages;
+
+          // Values are fetched on demand from pekoramons.lol/api/items/name/:itemName,
+          // so re-render while any request is still in flight to swap RAP
+          // fallbacks for the real values as they arrive.
+          scheduleSearchRefresh();
+        }
+
+        function scheduleSearchRefresh() {
+          clearTimeout(searchRefreshTimer);
+          searchRefreshTimer = setTimeout(() => {
+            if (!_pekoraSearchActive || searchGrid.style.display === "none") return;
+            if (_pekoraValueInFlight.size === 0) return;
+            renderPage();
+          }, 700);
         }
 
         spPrev.onclick = () => { if (searchPage > 0) { searchPage--; renderPage(); } };
@@ -1060,10 +1223,11 @@ ${obcTextRule}
           const selectedType = typeSelect ? typeSelect.value : "null";
           let pool = [...allItems];
           if (selectedType && selectedType !== "null") {
-            // The collectibles API doesn't return assetType, so match via items.json TypeId
+            // The collectibles API doesn't return assetType, so match via
+            // the /api/items catalog's TypeId when available.
             pool = pool.filter(item => {
               const id = item.assetId || item.userAssetId || "";
-              const entry = ITEMS.find(it => String(it.itemId || it.ItemId) === String(id));
+              const entry = ITEMS.find(it => String(it.itemId || it.ItemId || it.id) === String(id));
               if (entry && entry.TypeId) return String(entry.TypeId) === selectedType;
               // Fallback: check if API returned type info
               const t = String(item.assetType || item.assetTypeId || item.type || "");
@@ -1104,6 +1268,9 @@ ${obcTextRule}
 
         input.addEventListener("input", () => {
           const q = input.value.trim();
+          // Ask the API to resolve acronyms / IDs while the user is typing,
+          // so the value is already cached if the local filter misses it.
+          pekoraPrimeSearchCache(q);
           if (!q && sortSelect.value === "default") hideSearch(); else showSearch(q);
         });
         sortSelect.addEventListener("change", () => {
@@ -1338,7 +1505,7 @@ ${obcTextRule}
               const itemId = lookupIdForName(name);
               if (itemId) {
                 const linkEl = document.createElement("a");
-                linkEl.href = `https://www.koromons.net/item?id=${itemId}`;
+                linkEl.href = `${PEKORAMONS_BASE}/item?id=${itemId}`;
                 linkEl.target = "_blank";
                 linkEl.rel = "noopener noreferrer";
                 linkEl.style.cssText = "display:inline-flex;align-items:center;margin-left:4px;opacity:0.7;";
@@ -1451,9 +1618,13 @@ ${obcTextRule}
       document.head.appendChild(st);
     })();
 
-    function getKoromonValue(id) {
-      const it = ITEMS.find((i) => String(i.itemId) === String(id) || String(i.ItemId) === String(id));
-      return it && (it.Value || it.value) > 0 ? (it.Value || it.value) : 0;
+    // Values now come from pekoramons.lol/api/items/name/:itemName (lazily
+    // cached in NAME_VALUE_MAP by lookupValueForNameModal). The collectibles
+    // grid only gives us the asset id, so resolve by the item's displayed
+    // name instead.
+    function getPekoramonsValueByName(name) {
+      const v = lookupValueForNameModal(name);
+      return (typeof v === "number" && v > 0) ? v : 0;
     }
 
     function isUaidItem(name) {
@@ -1481,7 +1652,7 @@ ${obcTextRule}
       return Infinity;
     }
 
-    const ROLIMONS_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1094 1466.2" style="width:17px;height:17px;flex-shrink:0"><path fill="#0084dd" d="M1094 521.6 0 0v469.5l141-67.4 250 119.2L0 707.8v369.7l815.6 388.7L315 893l779-371.4z"></path></svg>`;
+    const PEKORAMONS_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1094 1466.2" style="width:17px;height:17px;flex-shrink:0"><path fill="#0084dd" d="M1094 521.6 0 0v469.5l141-67.4 250 119.2L0 707.8v369.7l815.6 388.7L315 893l779-371.4z"></path></svg>`;
 
     // ── Old-style Collectibles page: fetch every item up front instead of
     //    relying on the site's own paginated grid, so the whole inventory
@@ -1582,26 +1753,30 @@ ${obcTextRule}
             if (m) rap = parseInt(m[1].replace(/[.,]/g, ""), 10);
           }
 
-          const korVal = getKoromonValue(itemId);
+          const titleEl = card.querySelector(".card-body p.fw-bolder") || card.querySelector(".card-body p");
+          const cardName = titleEl ? titleEl.textContent.trim() : "";
+
+          const korVal = getPekoramonsValueByName(cardName);
           const val = korVal > 0 ? korVal : rap;
           totalValue += val;
 
-          if (!card.querySelector(".pekora-value")) {
-            const p = document.createElement("p");
-            p.className = "pekora-value mb-0 fw-bolder";
-            p.style.cssText = "color:#00b3ff;margin-top:8px;margin-bottom:0;padding-bottom:12px;white-space:nowrap;display:flex;align-items:center;justify-content:center;gap:4px;";
-            p.innerHTML = `${ROLIMONS_SVG}<span>Value: ${val.toLocaleString()}</span>`;
+          // Re-render the value line each pass (not just on creation) so it
+          // upgrades from the RAP fallback to the API value once it arrives.
+          let valueEl = card.querySelector(".pekora-value");
+          if (!valueEl) {
+            valueEl = document.createElement("p");
+            valueEl.className = "pekora-value mb-0 fw-bolder";
+            valueEl.style.cssText = "color:#00b3ff;margin-top:8px;margin-bottom:0;padding-bottom:12px;white-space:nowrap;display:flex;align-items:center;justify-content:center;gap:4px;";
             const body = card.querySelector(".card-body") || card;
             body.style.paddingBottom = "0px";
-            body.appendChild(p);
+            body.appendChild(valueEl);
           }
+          valueEl.innerHTML = `${PEKORAMONS_SVG}<span>Value: ${val.toLocaleString()}</span>`;
 
-          const title = card.querySelector(".card-body p.fw-bolder") || card.querySelector(".card-body p");
           card.dataset.value = val;
           card.dataset.rap = rap;
-          card.dataset.name = title ? title.textContent.trim() : "";
-          const rawName = card.dataset.name;
-          card.dataset.serial = isUaidItem(rawName) ? "uaid" : String(extractSerial(rawName));
+          card.dataset.name = cardName;
+          card.dataset.serial = isUaidItem(cardName) ? "uaid" : String(extractSerial(cardName));
         } catch (e) {
           console.debug("collectible card inject error", e);
         }
@@ -1971,7 +2146,7 @@ ${obcTextRule}
   (function () {
     "use strict";
 
-    const LEGACY_ROLIMONS_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1094 1466.2" style="width:15px;height:15px;flex-shrink:0"><path fill="#0084dd" d="M1094 521.6 0 0v469.5l141-67.4 250 119.2L0 707.8v369.7l815.6 388.7L315 893l779-371.4z"></path></svg>`;
+    const LEGACY_PEKORAMONS_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1094 1466.2" style="width:15px;height:15px;flex-shrink:0"><path fill="#0084dd" d="M1094 521.6 0 0v469.5l141-67.4 250 119.2L0 707.8v369.7l815.6 388.7L315 893l779-371.4z"></path></svg>`;
 
     (function injectLegacyTradeCSS() {
       const css = `[class*="col-0-2-"]:hover .pekora-legacy-value { display: none !important; }`;
@@ -1993,8 +2168,11 @@ ${obcTextRule}
           }
 
           if (nameEl.dataset.pekoraLegacyDone) return;
-          nameEl.dataset.pekoraLegacyDone = "1";
+          // Don't mark as done until we actually have a value — with the lazy
+          // API lookup the first pass usually has none yet, and marking early
+          // would permanently suppress the badge.
           if (typeof val !== "number" || val <= 0) return;
+          nameEl.dataset.pekoraLegacyDone = "1";
 
           // Placed under the item's slot box (col-0-2-N — the hash suffix isn't
           // stable so we match by prefix), not inside it: absolutely positioned
@@ -2009,7 +2187,7 @@ ${obcTextRule}
           const badge = document.createElement("div");
           badge.className = "pekora-legacy-value";
           badge.style.cssText = "position:absolute;left:0;right:0;top:100%;margin-top:2px;color:#0084dd !important;font-weight:700;font-size:14px;white-space:nowrap;display:flex;align-items:center;justify-content:center;gap:4px;pointer-events:none;z-index:5;";
-          badge.innerHTML = `${LEGACY_ROLIMONS_SVG}<span style="color:#0084dd !important;">${val.toLocaleString()}</span>`;
+          badge.innerHTML = `${LEGACY_PEKORAMONS_SVG}<span style="color:#0084dd !important;">${val.toLocaleString()}</span>`;
           box.appendChild(badge);
         } catch (e) {
           console.debug("[pekora] legacy trade item inject error", e);
@@ -2068,7 +2246,7 @@ ${obcTextRule}
         // Left-aligned to valueP's own left edge (the "T" in "Total RAP"),
         // not the parent's, since valueP itself may be inset/padded within it.
         totalLine.style.left = valueP.offsetLeft + "px";
-        totalLine.innerHTML = `<span style="white-space:nowrap;">Total Value:</span>${LEGACY_ROLIMONS_SVG}<span style="white-space:nowrap;color:#0084dd;"></span>`;
+        totalLine.innerHTML = `<span style="white-space:nowrap;">Total Value:</span>${LEGACY_PEKORAMONS_SVG}<span style="white-space:nowrap;color:#0084dd;"></span>`;
         valueP.insertAdjacentElement("afterend", totalLine);
       }
       // Update the number in place every pass (instead of only on creation)
