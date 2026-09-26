@@ -19,7 +19,7 @@
 (function () {
   "use strict";
 
-  const PEKORA_DEBUG = true;
+  const PEKORA_DEBUG = false;
   function dbg(...a) { if (PEKORA_DEBUG) console.log("[pekora]", ...a); }
   function warn(...a) { console.warn("[pekora]", ...a); }
 
@@ -38,9 +38,6 @@
   let NAME_ACRONYM_MAP = new Map();
   let FETCHED = false;
 
-  // ---------------------------------------------------------------------------
-  // Low-level JSON fetch with fallback chain.
-  // ---------------------------------------------------------------------------
   function pekoraFetchOneJson(url) {
     return new Promise((resolve, reject) => {
       const headers = {
@@ -89,8 +86,6 @@
     if (/^https?:\/\//i.test(path)) {
       candidates.push(path);
     } else {
-      // Try same-origin first (pekora.pro might proxy /api/*), then each
-      // pekoramons host.
       candidates.push(location.origin + path);
       for (const h of PEKORAMONS_HOSTS) candidates.push(h + path);
     }
@@ -2018,20 +2013,19 @@ ${obcTextRule}
   /* ---------------------------
      Catalog Item Page
      Adds the pekoramons.lol value under the "Best Price" block.
-     Tries /api/items/search first (lenient), then /api/items/name/ (exact).
-     If both fail → shows "Value: N/A" in grey, stops retrying.
+     1. Tries /api/items/search?q=   (lenient, also returns value)
+     2. Falls back to /api/items/name/:itemName  (exact)
+     If both miss → shows "Value: N/A" in grey (small) and stops retrying.
   --------------------------- */
   (function () {
     "use strict";
 
     const CATALOG_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1094 1466.2" style="width:16px;height:16px;flex-shrink:0;vertical-align:middle;"><path fill="#0084dd" d="M1094 521.6 0 0v469.5l141-67.4 250 119.2L0 707.8v369.7l815.6 388.7L315 893l779-371.4z"></path></svg>`;
+    const CATALOG_SVG_GREY = CATALOG_SVG.replace('#0084dd', '#7a7a7a');
 
-    // Names already resolved (or determined to have no value) so we don't
-    // hammer the API every 300ms tick.
     const _catalogResolved = new Set();
 
     function getCatalogItemName() {
-      // Preferred: heading text on the item page.
       const h1 = document.querySelector("h1");
       if (h1) {
         const t = (h1.textContent || "").replace(/[\u200B-\u200F\uFEFF]/g, "").replace(/\s+/g, " ").trim();
@@ -2045,18 +2039,17 @@ ${obcTextRule}
       return name.replace(/-/g, ' ').replace(/\s+/g, ' ').trim();
     }
 
+    // Same layout for all three states — always icon + text, so the row
+    // keeps its shape. The N/A variant keeps the icon (grey) and matches
+    // the blue value's size, just muted.
     function renderCatalogValue(valueEl, state, value) {
-      let ink = "#00b3ff";
-      let text;
       if (state === "loading") {
-        text = "Value: ...";
+        valueEl.innerHTML = `${CATALOG_SVG}<span style="color:#00b3ff;font-weight:700;font-size:14px;">Value: ...</span>`;
       } else if (state === "ok") {
-        text = "Value: " + Number(value).toLocaleString();
+        valueEl.innerHTML = `${CATALOG_SVG}<span style="color:#00b3ff;font-weight:700;font-size:14px;">Value: ${Number(value).toLocaleString()}</span>`;
       } else {
-        ink = "#888";
-        text = "Value: N/A";
+        valueEl.innerHTML = `${CATALOG_SVG_GREY}<span style="color:#7a7a7a;font-weight:700;font-size:13px;line-height:1.2;">Value: N/A</span>`;
       }
-      valueEl.innerHTML = `${CATALOG_SVG}<span style="color:${ink};font-weight:700;">${text}</span>`;
     }
 
     async function trySearchEndpoint(name) {
@@ -2086,22 +2079,16 @@ ${obcTextRule}
     async function resolveCatalogValue(itemName) {
       const key = cleanNameForLookup(itemName);
       if (!key) return null;
-
       if (NAME_VALUE_MAP.has(key)) {
         const v = NAME_VALUE_MAP.get(key);
         if (isFinite(v) && v > 0) return v;
       }
-
-      // 1. /api/items/search (lenient, used by bot / global search).
       let hit = await trySearchEndpoint(itemName);
-      // 2. /api/items/name (exact, case-insensitive).
       if (!hit) hit = await tryNameEndpoint(itemName);
-      // 3. Retry search with the stripped name (no parenthesized suffixes).
       if (!hit) {
         const stripped = itemName.replace(/\(.*?\)|\[.*?\]|\{.*?\}/g, "").trim();
         if (stripped && stripped !== itemName) hit = await trySearchEndpoint(stripped);
       }
-
       if (hit) {
         NAME_VALUE_MAP.set(key, hit.value);
         if (hit.canon) NAME_VALUE_MAP.set(cleanNameForLookup(hit.canon), hit.value);
@@ -2128,14 +2115,46 @@ ${obcTextRule}
         const val = await resolveCatalogValue(itemName);
         _catalogResolved.add(key);
         if (!valueEl.isConnected) return;
-        if (isFinite(val) && val > 0) {
-          renderCatalogValue(valueEl, "ok", val);
-        } else {
-          renderCatalogValue(valueEl, "n/a");
-        }
+        if (isFinite(val) && val > 0) renderCatalogValue(valueEl, "ok", val);
+        else renderCatalogValue(valueEl, "n/a");
       } finally {
         valueEl._pekoraLoading = false;
       }
+    }
+
+    // Locate the price column (block that holds the price + subtitle, but
+    // NOT the Buy button). Walk up from the price number until the parent
+    // would start containing Buy; the last element is the price column.
+    function findPriceColumn() {
+      const allEls = [...document.querySelectorAll('*')];
+
+      const bestPriceEl = allEls.find(el =>
+        el.children.length === 0 && /^Best Price$/i.test((el.textContent || "").trim())
+      );
+      if (!bestPriceEl) return null;
+
+      const buyBtn = allEls.find(el => {
+        if (el.tagName !== "BUTTON" && el.tagName !== "A") return false;
+        const t = (el.textContent || "").trim();
+        return /^Buy$/i.test(t);
+      });
+
+      const startIdx = allEls.indexOf(bestPriceEl);
+      let priceNumEl = null;
+      for (let i = startIdx + 1; i < Math.min(startIdx + 120, allEls.length); i++) {
+        const el = allEls[i];
+        if (el.children.length !== 0) continue;
+        const t = (el.textContent || "").trim();
+        if (t.length >= 2 && /^[\d,]+$/.test(t)) { priceNumEl = el; break; }
+      }
+      if (!priceNumEl) return null;
+
+      let el = priceNumEl;
+      while (el.parentElement) {
+        if (buyBtn && el.parentElement.contains(buyBtn)) break;
+        el = el.parentElement;
+      }
+      return el;
     }
 
     function runCatalogInjector() {
@@ -2143,51 +2162,19 @@ ${obcTextRule}
       const itemName = getCatalogItemName();
       if (!itemName) return;
 
-      // Fast path: already injected.
-      let valueEl = document.querySelector(".pekora-catalog-value");
-      if (valueEl && valueEl.isConnected) {
+      const column = findPriceColumn();
+      if (!column) return;
+
+      let valueEl = column.querySelector(":scope > .pekora-catalog-value");
+      if (!valueEl) valueEl = document.querySelector(".pekora-catalog-value");
+
+      const stillInRightPlace = valueEl && valueEl.isConnected && valueEl.parentElement === column;
+      if (stillInRightPlace) {
         refreshCatalogValue(valueEl, itemName);
         return;
       }
 
-      // Slow path: locate the price column and inject once.
-      const allEls = [...document.querySelectorAll('*')];
-      const bestPriceEl = allEls.find(el =>
-        el.children.length === 0 && /^Best Price$/i.test((el.textContent || "").trim())
-      );
-      if (!bestPriceEl) return;
-
-      const bestPriceIdx = allEls.indexOf(bestPriceEl);
-
-      // Anchor: "Resellers" link right under the price.
-      let anchor = null;
-      for (let i = bestPriceIdx + 1; i < Math.min(bestPriceIdx + 100, allEls.length); i++) {
-        const el = allEls[i];
-        if (el.tagName !== "A") continue;
-        const t = (el.textContent || "").trim();
-        if (t.length <= 40 && /resellers/i.test(t)) { anchor = el; break; }
-      }
-
-      // Fallback: walk up from the price number until the ancestor no longer
-      // contains "Best Price" — that's the price column.
-      let fallbackCol = null;
-      if (!anchor) {
-        let priceNumEl = null;
-        for (let i = bestPriceIdx + 1; i < Math.min(bestPriceIdx + 60, allEls.length); i++) {
-          const el = allEls[i];
-          const t = (el.textContent || "").trim();
-          if (el.children.length === 0 && t.length >= 2 && /^[\d,]+$/.test(t)) { priceNumEl = el; break; }
-        }
-        if (priceNumEl) {
-          let el = priceNumEl;
-          while (el.parentElement && !/Best Price/i.test(el.parentElement.textContent || "")) {
-            el = el.parentElement;
-          }
-          fallbackCol = el;
-        }
-      }
-
-      if (!anchor && !fallbackCol) return;
+      if (valueEl && valueEl.isConnected) valueEl.remove();
 
       valueEl = document.createElement("div");
       valueEl.className = "pekora-catalog-value";
@@ -2197,18 +2184,21 @@ ${obcTextRule}
         "justify-content:flex-start",
         "gap:4px",
         "margin-top:6px",
-        "color:#00b3ff",
-        "font-weight:700",
-        "font-size:14px",
         "line-height:1.2",
         "white-space:nowrap",
       ].join(";");
 
-      if (anchor) {
-        anchor.insertAdjacentElement("afterend", valueEl);
-      } else {
-        fallbackCol.appendChild(valueEl);
-      }
+      // Force the column to stack vertically so our line drops below the
+      // price / subtitle instead of being laid inline.
+      try {
+        const cs = getComputedStyle(column);
+        if (cs.display === "flex" && cs.flexDirection !== "column") {
+          column.style.setProperty("flex-direction", "column", "important");
+          column.style.setProperty("align-items", "flex-start", "important");
+        }
+      } catch (e) {}
+
+      column.appendChild(valueEl);
 
       dbg("catalog: resolving value for", JSON.stringify(itemName));
       refreshCatalogValue(valueEl, itemName);
